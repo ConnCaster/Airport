@@ -755,11 +755,10 @@ static void notify_visualizer_renderMove(const std::string& baseUrl, const json&
 // -----------------------------
 int main(int argc, char** argv) {
     int port = 8001;
-    std::string mapFile = "/home/user/dir/programming/C++/Yaroslava/Airport/GroundControl/GroundMap.txt";
+    std::string mapFile = "/home/user/dir/programming/C++/Yaroslava/Airport/GroundControl/GroundMap.json";
 
     GroundControl gc;
 
-    // если карту не дали — поднимем маленькую демо
     if (!mapFile.empty()) {
         std::ifstream in(mapFile);
         if (!in) {
@@ -769,20 +768,6 @@ int main(int argc, char** argv) {
         json j;
         in >> j;
         gc.load_map_from_json(j);
-    } else {
-        json demo = {
-            {"nodes", json::array({
-                {{"name","G-11"},{"capacity",1},{"type","gate"}},
-                {{"name","CR-1"},{"capacity",1},{"type","crossroad"}},
-                {{"name","R1"},{"capacity",1},{"type","runway"}},
-                {{"name","P1"},{"capacity",1},{"type","planeParking"}}
-            })},
-            {"edges", json::array({
-                {{"name","E-15"},{"capacity",2},{"type","carRoad"},{"node1","G-11"},{"node2","CR-1"}},
-                {{"name","E-1"},{"capacity",2},{"type","carRoad"},{"node1","CR-1"},{"node2","R1"}}
-            })}
-        };
-        gc.load_map_from_json(demo);
     }
 
     const std::string renderBaseUrl = getenv_str("GC_RENDER_BASE_URL"); // пример: http://localhost:9000
