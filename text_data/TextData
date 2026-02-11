@@ -1,0 +1,55 @@
+### Быстрый smoke test
+Инициализировать рейс (ожидаемый к текущему времени):
+
+```curl -X POST http://localhost:8082/v1/flights/init \
+  -H "Content-Type: application/json" \
+  -d '{"flights":[{"flightId":"SU100","scheduledAt":1700000000,"status":"Scheduled"}]}'
+```
+Инициализировать машинки FollowMe:
+
+```curl -X POST http://localhost:8083/v1/vehicles/init \
+  -H "Content-Type: application/json" \
+  -d '{"vehicles":[
+    {"vehicleId":"FM-1","currentNode":"FS-1","status":"empty"},
+    {"vehicleId":"FM-2","currentNode":"FS-1","status":"empty"},
+    {"vehicleId":"FM-3","currentNode":"FS-1","status":"empty"}
+  ]}'
+```
+
+Запрос разрешения посадки:
+
+```
+curl "http://localhost:8081/v1/land_permission?flightId=SU100"
+```
+Подтверждение приземления самолёта в RE-1:
+
+```
+curl -X POST http://localhost:8081/v1/flights/SU100/landed
+```
+Состояние для визуализатора:
+
+```
+curl "http://localhost:8081/v1/visualizer/snapshot"
+curl "http://localhost:8081/v1/visualizer/events?since=0"
+```
+
+
+6) Что отправлять в AirportVisualizer (best-practice)
+
+Разработчику визуализатора достаточно двух вызовов:
+
+На старте:
+GET /v1/visualizer/snapshot
+Получает полную картину: карта, кто где стоит, сессии рейсов.
+
+Дальше по циклу:
+GET /v1/visualizer/events?since=<lastSeq>
+Получает только изменения (vehicle.enter_edge, vehicle.leave_edge, flight.landed_re1 и т.д.)
+
+Такой подход:
+
+стабилен (можно восстановиться после отрыва связи),
+
+масштабируем (incremental updates),
+
+не требует tight coupling.
