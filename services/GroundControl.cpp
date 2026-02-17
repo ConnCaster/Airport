@@ -1,0 +1,927 @@
+#include <fstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <mutex>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+
+#include "common.h"
+
+using app::json;
+
+struct Node {
+    std::string name;
+    int capacity = 1;
+    std::string type;
+};
+
+struct Edge {
+    std::string name;
+    int capacity = 1;
+    std::string type; // "carRoad|planeRoad"
+    std::string node1;
+    std::string node2;
+};
+
+struct VehiclePos {
+    enum class Kind { Node, Edge } kind = Kind::Node;
+    std::string place;     // node name or edge name
+    std::string lastNode;  // last known node (for edge transit)
+};
+
+struct FlightSession {
+    std::string flightId;
+    std::string vehicleId;
+    std::string parkingNode;
+
+    bool landingApproved = false;
+    bool landed = false;
+    std::string status = "Created";
+    int64_t createdAt = 0;
+};
+
+class GroundControl {
+public:
+    GroundControl(std::string panelHost, int panelPort, std::string fmHost, int fmPort)
+        : panelHost_(std::move(panelHost)),
+          panelPort_(panelPort),
+          fmHost_(std::move(fmHost)),
+          fmPort_(fmPort) {}
+
+    bool load_map(const std::string& filePath) {
+        std::ifstream in(filePath);
+        if (!in) {
+            std::cerr << "[GroundControl] cannot open map file: " << filePath << '\n';
+            return false;
+        }
+
+        json doc;
+        in >> doc;
+
+        if (!doc.contains("nodes") || !doc["nodes"].is_array() ||
+            !doc.contains("edges") || !doc["edges"].is_array()) {
+            std::cerr << "[GroundControl] invalid map json\n";
+            return false;
+        }
+
+        for (const auto& n : doc["nodes"]) {
+            Node node;
+            node.name = n.at("name").get<std::string>();
+            node.capacity = n.value("capacity", 1);
+            node.type = n.value("type", "");
+            nodes_[node.name] = node;
+        }
+
+        for (const auto& e : doc["edges"]) {
+            Edge edge;
+            edge.name = e.at("name").get<std::string>();
+            edge.capacity = e.value("capacity", 1);
+            edge.type = e.value("type", "");
+            edge.node1 = e.at("node1").get<std::string>();
+            edge.node2 = e.at("node2").get<std::string>();
+            edges_[edge.name] = edge;
+            adjacency_[edge.node1].push_back(edge.name);
+            adjacency_[edge.node2].push_back(edge.name);
+        }
+
+        return true;
+    }
+
+    void run(int port) {
+        httplib::Server svr;
+
+        svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+            app::reply_json(res, 200, {
+                {"service", "GroundControl"},
+                {"status", "ok"},
+                {"time", app::now_sec()}
+            });
+        });
+
+        // Initial vehicle positions from FollowMe
+        svr.Post("/v1/vehicles/init", [&](const httplib::Request& req, httplib::Response& res) {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt) {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+            if (!body.contains("vehicles") || !body["vehicles"].is_array()) {
+                app::reply_json(res, 400, {{"error", "'vehicles' array required"}});
+                return;
+            }
+
+            json accepted = json::array();
+            json rejected = json::array();
+
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (const auto& v : body["vehicles"]) {
+                const std::string vid = app::s_or(v, "vehicleId");
+                const std::string node = v.value("currentNode", std::string("FS-1"));
+                if (vid.empty() || nodes_.find(node) == nodes_.end()) {
+                    rejected.push_back({{"vehicleId", vid}, {"reason", "bad_input"}});
+                    continue;
+                }
+
+                if (!node_has_slot_unsafe(node)) {
+                    rejected.push_back({{"vehicleId", vid}, {"reason", "node_full"}, {"node", node}});
+                    continue;
+                }
+
+                // remove old if existed
+                if (vehiclePos_.count(vid)) {
+                    auto old = vehiclePos_[vid];
+                    if (old.kind == VehiclePos::Kind::Node) {
+                        nodeOcc_[old.place].erase("vehicle:" + vid);
+                    } else {
+                        edgeOcc_[old.place].erase("vehicle:" + vid);
+                    }
+                }
+
+                vehiclePos_[vid] = VehiclePos{VehiclePos::Kind::Node, node, node};
+                nodeOcc_[node].insert("vehicle:" + vid);
+                accepted.push_back({{"vehicleId", vid}, {"node", node}});
+                push_event_unsafe("vehicle.init", {
+                    {"vehicleId", vid},
+                    {"node", node}
+                });
+            }
+
+            app::reply_json(res, 200, {
+                {"ok", true},
+                {"accepted", accepted},
+                {"rejected", rejected}
+            });
+        });
+
+        // 1) plane asks landing permission
+        svr.Get("/v1/land_permission", [&](const httplib::Request& req, httplib::Response& res) {
+            if (!req.has_param("flightId")) {
+                app::reply_json(res, 400, {{"error", "flightId query param is required"}});
+                return;
+            }
+            const std::string flightId = req.get_param_value("flightId");
+
+            // idempotency: if already approved -> return same
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = sessions_.find(flightId);
+                if (it != sessions_.end() && it->second.landingApproved) {
+                    app::reply_json(res, 200, {
+                        {"flightId", flightId},
+                        {"allowed", true},
+                        {"parking", it->second.parkingNode},
+                        {"vehicleId", it->second.vehicleId},
+                        {"reason", "already_approved"}
+                    });
+                    return;
+                }
+            }
+
+            // Check with InformationPanel: expected now/past?
+            {
+                const std::string path = "/v1/flights/" + flightId + "?ts=" + std::to_string(app::now_sec());
+                auto panelRes = app::http_get_json(panelHost_, panelPort_, path);
+                if (!panelRes.ok() || !panelRes.body.value("expectedNowOrPast", false)) {
+                    notify_panel_status(flightId, "Denied", "flight_not_expected");
+                    app::reply_json(res, 200, {
+                        {"flightId", flightId},
+                        {"allowed", false},
+                        {"retryAfterSec", 30},
+                        {"reason", "flight_not_expected"}
+                    });
+                    return;
+                }
+            }
+
+            // Check free followme vehicle + reserve vehicle in FollowMe
+            auto hasEmpty = app::http_get_json(fmHost_, fmPort_, "/v1/vehicles/hasEmpty");
+            if (!hasEmpty.ok() || !hasEmpty.body.value("hasEmpty", false)) {
+                notify_panel_status(flightId, "Delayed", "no_followme_available");
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"allowed", false},
+                    {"retryAfterSec", 30},
+                    {"reason", "no_followme_available"}
+                });
+                return;
+            }
+
+            auto reserveRes = app::http_post_json(fmHost_, fmPort_, "/v1/vehicles/reserve", {
+                {"flightId", flightId}
+            });
+            if (!reserveRes.ok()) {
+                notify_panel_status(flightId, "Delayed", "followme_reservation_failed");
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"allowed", false},
+                    {"retryAfterSec", 30},
+                    {"reason", "followme_reservation_failed"}
+                });
+                return;
+            }
+            const std::string vehicleId = reserveRes.body.value("vehicleId", "");
+
+            // Reserve RE-1 + parking atomically
+            bool reserved = false;
+            std::string parking;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+
+                if (!node_has_slot_unsafe("RE-1")) {
+                    reserved = false;
+                } else {
+                    parking = choose_free_parking_unsafe();
+                    if (!parking.empty()) {
+                        // reserve parking and RE-1
+                        reservedParking_.insert(parking);
+                        nodeOcc_["RE-1"].insert("reservation:" + flightId);
+
+                        FlightSession s;
+                        s.flightId = flightId;
+                        s.vehicleId = vehicleId;
+                        s.parkingNode = parking;
+                        s.landingApproved = true;
+                        s.status = "LandingApproved";
+                        s.createdAt = app::now_sec();
+
+                        sessions_[flightId] = s;
+                        push_event_unsafe("flight.landing_approved", {
+                            {"flightId", flightId},
+                            {"vehicleId", vehicleId},
+                            {"parking", parking}
+                        });
+                        reserved = true;
+                    }
+                }
+            }
+
+            if (!reserved) {
+                // release reserved vehicle in FollowMe
+                if (!vehicleId.empty()) {
+                    app::http_post_json(fmHost_, fmPort_, "/v1/vehicles/release", {
+                        {"vehicleId", vehicleId}
+                    });
+                }
+                notify_panel_status(flightId, "Delayed", "re1_or_parking_unavailable");
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"allowed", false},
+                    {"retryAfterSec", 30},
+                    {"reason", "re1_or_parking_unavailable"}
+                });
+                return;
+            }
+
+            notify_panel_status(flightId, "LandingApproved", "all_resources_reserved");
+            app::reply_json(res, 200, {
+                {"flightId", flightId},
+                {"allowed", true},
+                {"vehicleId", vehicleId},
+                {"parking", parking}
+            });
+        });
+
+        // plane confirms landed to RE-1
+        svr.Post(R"(/v1/flights/([A-Za-z0-9\-_]+)/landed)", [&](const httplib::Request& req, httplib::Response& res) {
+            const std::string flightId = req.matches[1];
+
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = sessions_.find(flightId);
+            if (it == sessions_.end() || !it->second.landingApproved) {
+                app::reply_json(res, 404, {{"error", "flight session not found or not approved"}});
+                return;
+            }
+
+            // replace reservation in RE-1 by plane occupancy
+            nodeOcc_["RE-1"].erase("reservation:" + flightId);
+            if (!node_has_slot_unsafe("RE-1")) {
+                app::reply_json(res, 409, {{"error", "RE-1 full"}});
+                return;
+            }
+            nodeOcc_["RE-1"].insert("plane:" + flightId);
+
+            it->second.landed = true;
+            it->second.status = "LandedAtRE1";
+            push_event_unsafe("flight.landed_re1", {{"flightId", flightId}});
+
+            app::reply_json(res, 200, {
+                {"ok", true},
+                {"flightId", flightId},
+                {"status", it->second.status}
+            });
+        });
+
+        // followme asks mission path
+        auto mission_path_handler = [&](const std::string& flightId, httplib::Response& res) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = sessions_.find(flightId);
+            if (it == sessions_.end()) {
+                app::reply_json(res, 404, {{"error", "session_not_found"}});
+                return;
+            }
+
+            const auto& s = it->second;
+            std::string vehicleNode = "FS-1";
+
+            auto pIt = vehiclePos_.find(s.vehicleId);
+            if (pIt != vehiclePos_.end()) {
+                if (pIt->second.kind == VehiclePos::Kind::Node) {
+                    vehicleNode = pIt->second.place;
+                } else {
+                    vehicleNode = pIt->second.lastNode;
+                }
+            }
+
+            auto routeToRunway = shortest_path_nodes_unsafe(vehicleNode, "RE-1", "carRoad");
+            auto routeWithPlane = shortest_path_nodes_unsafe("RE-1", s.parkingNode, "planeRoad");
+            auto routeReturn = shortest_path_nodes_unsafe(s.parkingNode, "FS-1", "carRoad");
+
+            app::reply_json(res, 200, {
+                {"flightId", flightId},
+                {"vehicleId", s.vehicleId},
+                {"from", "RE-1"},
+                {"to", s.parkingNode},
+                {"routeToRunway", routeToRunway},
+                {"routeWithPlane", routeWithPlane},
+                {"routeReturn", routeReturn}
+            });
+        };
+
+        svr.Get("/v1/map/followme/path", [&](const httplib::Request& req, httplib::Response& res) {
+            if (!req.has_param("flightId")) {
+                app::reply_json(res, 400, {{"error", "flightId required"}});
+                return;
+            }
+            mission_path_handler(req.get_param_value("flightId"), res);
+        });
+
+        // backward-compat from your draft:
+        svr.Get(R"(/v1/map/followme/path/flightId=([A-Za-z0-9\-_]+))",
+                [&](const httplib::Request& req, httplib::Response& res) {
+            mission_path_handler(req.matches[1], res);
+        });
+
+        auto permission_handler = [&](const std::string& flightId, httplib::Response& res) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = sessions_.find(flightId);
+            if (it == sessions_.end()) {
+                app::reply_json(res, 404, {{"error", "session_not_found"}});
+                return;
+            }
+            app::reply_json(res, 200, {
+                {"flightId", flightId},
+                {"allowed", it->second.landed}
+            });
+        };
+
+        svr.Get("/v1/map/followme/permission", [&](const httplib::Request& req, httplib::Response& res) {
+            if (!req.has_param("flightId")) {
+                app::reply_json(res, 400, {{"error", "flightId required"}});
+                return;
+            }
+            permission_handler(req.get_param_value("flightId"), res);
+        });
+
+        svr.Get(R"(/v1/map/followme/permission/flightId=([A-Za-z0-9\-_]+))",
+                [&](const httplib::Request& req, httplib::Response& res) {
+            permission_handler(req.matches[1], res);
+        });
+
+        // FollowMe asks to enter edge (atomic check edge capacity + current position)
+        svr.Post("/v1/map/traffic/enter-edge", [&](const httplib::Request& req, httplib::Response& res) {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt) {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+
+            const std::string vehicleId = app::s_or(body, "vehicleId");
+            const std::string from = app::s_or(body, "from");
+            const std::string to = app::s_or(body, "to");
+
+            if (vehicleId.empty() || from.empty() || to.empty()) {
+                app::reply_json(res, 400, {{"error", "vehicleId, from, to required"}});
+                return;
+            }
+
+            std::lock_guard<std::mutex> lk(mtx_);
+
+            // auto-register if absent
+            if (!vehiclePos_.count(vehicleId)) {
+                if (nodes_.count(from) == 0 || !node_has_slot_unsafe(from)) {
+                    app::reply_json(res, 409, {
+                        {"granted", false},
+                        {"reason", "cannot_register_vehicle_on_from_node"}
+                    });
+                    return;
+                }
+                vehiclePos_[vehicleId] = VehiclePos{VehiclePos::Kind::Node, from, from};
+                nodeOcc_[from].insert("vehicle:" + vehicleId);
+            }
+
+            auto& pos = vehiclePos_[vehicleId];
+
+            // idempotent case: already on edge from->to
+            if (pos.kind == VehiclePos::Kind::Edge) {
+                const auto& e = edges_.at(pos.place);
+                const bool same = ((e.node1 == from && e.node2 == to) || (e.node1 == to && e.node2 == from));
+                if (same) {
+                    app::reply_json(res, 200, {{"granted", true}, {"edge", e.name}, {"idempotent", true}});
+                    return;
+                }
+            }
+
+            if (pos.kind != VehiclePos::Kind::Node || pos.place != from) {
+                app::reply_json(res, 409, {
+                    {"granted", false},
+                    {"reason", "vehicle_not_on_from_node"},
+                    {"current", pos.place}
+                });
+                return;
+            }
+
+            auto edgeOpt = find_edge_between_unsafe(from, to, "carRoad");
+            if (!edgeOpt) {
+                app::reply_json(res, 404, {{"granted", false}, {"reason", "edge_not_found"}});
+                return;
+            }
+            const std::string edgeName = *edgeOpt;
+
+            if (!edge_has_slot_unsafe(edgeName)) {
+                app::reply_json(res, 409, {
+                    {"granted", false},
+                    {"reason", "edge_busy"},
+                    {"edge", edgeName}
+                });
+                return;
+            }
+
+            nodeOcc_[from].erase("vehicle:" + vehicleId);
+            edgeOcc_[edgeName].insert("vehicle:" + vehicleId);
+
+            pos.kind = VehiclePos::Kind::Edge;
+            pos.place = edgeName;
+            pos.lastNode = from;
+
+            push_event_unsafe("vehicle.enter_edge", {
+                {"vehicleId", vehicleId},
+                {"from", from},
+                {"to", to},
+                {"edge", edgeName}
+            });
+
+            app::reply_json(res, 200, {
+                {"granted", true},
+                {"edge", edgeName}
+            });
+        });
+
+        // FollowMe asks to leave edge to node
+        svr.Post("/v1/map/traffic/leave-edge", [&](const httplib::Request& req, httplib::Response& res) {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt) {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+
+            const std::string vehicleId = app::s_or(body, "vehicleId");
+            const std::string to = app::s_or(body, "to");
+            if (vehicleId.empty() || to.empty()) {
+                app::reply_json(res, 400, {{"error", "vehicleId, to required"}});
+                return;
+            }
+
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = vehiclePos_.find(vehicleId);
+            if (it == vehiclePos_.end()) {
+                app::reply_json(res, 404, {{"granted", false}, {"reason", "vehicle_not_found"}});
+                return;
+            }
+
+            auto& pos = it->second;
+
+            // idempotent: already in node to
+            if (pos.kind == VehiclePos::Kind::Node && pos.place == to) {
+                app::reply_json(res, 200, {{"granted", true}, {"idempotent", true}});
+                return;
+            }
+
+            if (pos.kind != VehiclePos::Kind::Edge) {
+                app::reply_json(res, 409, {{"granted", false}, {"reason", "vehicle_not_on_edge"}});
+                return;
+            }
+
+            const std::string edgeName = pos.place;
+            const auto& e = edges_.at(edgeName);
+
+            const bool connected = (e.node1 == to || e.node2 == to);
+            if (!connected) {
+                app::reply_json(res, 409, {
+                    {"granted", false},
+                    {"reason", "target_node_not_connected_to_current_edge"},
+                    {"edge", edgeName}
+                });
+                return;
+            }
+
+            bool canEnterTarget = node_has_slot_unsafe(to);
+
+            if (!canEnterTarget) {
+                const std::string flightId = app::s_or(body, "flightId");
+
+                // Спец-правило: FollowMe может "доковаться" в RE-1 к своему самолету
+                if (to == "RE-1" && !flightId.empty()) {
+                    const auto& occ = nodeOcc_["RE-1"];
+                    if (occ.count("plane:" + flightId) > 0) {
+                        canEnterTarget = true;
+                    }
+                }
+            }
+
+            if (!canEnterTarget) {
+                app::reply_json(res, 409, {
+                    {"granted", false},
+                    {"reason", "target_node_busy"},
+                    {"node", to}
+                });
+                return;
+            }
+
+            edgeOcc_[edgeName].erase("vehicle:" + vehicleId);
+            nodeOcc_[to].insert("vehicle:" + vehicleId);
+
+            pos.kind = VehiclePos::Kind::Node;
+            pos.place = to;
+            pos.lastNode = to;
+
+            push_event_unsafe("vehicle.leave_edge", {
+                {"vehicleId", vehicleId},
+                {"to", to},
+                {"edge", edgeName}
+            });
+
+            app::reply_json(res, 200, {{"granted", true}});
+        });
+
+        // FollowMe informs: arrived parking with plane
+        svr.Post("/v1/vehicles/followme", [&](const httplib::Request& req, httplib::Response& res) {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt) {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+
+            const std::string flightId = app::s_or(body, "flightId");
+            const std::string status = app::s_or(body, "status");
+            if (flightId.empty() || status.empty()) {
+                app::reply_json(res, 400, {{"error", "flightId and status required"}});
+                return;
+            }
+
+            if (status != "arrivedParking") {
+                app::reply_json(res, 400, {{"error", "unsupported status"}});
+                return;
+            }
+
+            std::string parking;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = sessions_.find(flightId);
+                if (it == sessions_.end()) {
+                    app::reply_json(res, 404, {{"error", "session_not_found"}});
+                    return;
+                }
+
+                parking = it->second.parkingNode;
+
+                // move plane RE-1 -> parking
+                nodeOcc_["RE-1"].erase("plane:" + flightId);
+                if (node_has_slot_unsafe(parking)) {
+                    nodeOcc_[parking].insert("plane:" + flightId);
+                }
+                it->second.status = "ArrivedParking";
+
+                push_event_unsafe("flight.arrived_parking", {
+                    {"flightId", flightId},
+                    {"parking", parking}
+                });
+            }
+
+            notify_panel_status(flightId, "ArrivedParking", "plane_on_stand");
+            app::reply_json(res, 200, {
+                {"ok", true},
+                {"flightId", flightId},
+                {"parking", parking}
+            });
+        });
+
+        // FollowMe mission completed and vehicle returned
+        svr.Post("/v1/followme/mission/completed", [&](const httplib::Request& req, httplib::Response& res) {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt) {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+            const std::string flightId = app::s_or(body, "flightId");
+            const std::string vehicleId = app::s_or(body, "vehicleId");
+
+            if (flightId.empty() || vehicleId.empty()) {
+                app::reply_json(res, 400, {{"error", "flightId and vehicleId required"}});
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = sessions_.find(flightId);
+                if (it != sessions_.end()) {
+                    it->second.status = "MissionCompleted";
+                }
+                push_event_unsafe("mission.completed", {
+                    {"flightId", flightId},
+                    {"vehicleId", vehicleId}
+                });
+            }
+
+            notify_panel_status(flightId, "Parked", "followme_returned_to_base");
+            app::reply_json(res, 200, {{"ok", true}});
+        });
+
+        // Visualizer snapshot API
+        svr.Get("/v1/visualizer/snapshot", [&](const httplib::Request&, httplib::Response& res) {
+            std::lock_guard<std::mutex> lk(mtx_);
+
+            json nodes = json::array();
+            for (const auto& [name, n] : nodes_) {
+                json occ = json::array();
+                if (nodeOcc_.count(name)) {
+                    for (const auto& x : nodeOcc_[name]) occ.push_back(x);
+                }
+                nodes.push_back({
+                    {"name", n.name},
+                    {"type", n.type},
+                    {"capacity", n.capacity},
+                    {"occupiedBy", occ}
+                });
+            }
+
+            json edges = json::array();
+            for (const auto& [name, e] : edges_) {
+                json occ = json::array();
+                if (edgeOcc_.count(name)) {
+                    for (const auto& x : edgeOcc_[name]) occ.push_back(x);
+                }
+                edges.push_back({
+                    {"name", e.name},
+                    {"type", e.type},
+                    {"capacity", e.capacity},
+                    {"node1", e.node1},
+                    {"node2", e.node2},
+                    {"occupiedBy", occ}
+                });
+            }
+
+            json sessions = json::array();
+            for (const auto& [id, s] : sessions_) {
+                sessions.push_back({
+                    {"flightId", s.flightId},
+                    {"vehicleId", s.vehicleId},
+                    {"parkingNode", s.parkingNode},
+                    {"landingApproved", s.landingApproved},
+                    {"landed", s.landed},
+                    {"status", s.status},
+                    {"createdAt", s.createdAt}
+                });
+            }
+
+            app::reply_json(res, 200, {
+                {"time", app::now_sec()},
+                {"seq", seq_},
+                {"nodes", nodes},
+                {"edges", edges},
+                {"sessions", sessions}
+            });
+        });
+
+        // Visualizer incremental events
+        svr.Get("/v1/visualizer/events", [&](const httplib::Request& req, httplib::Response& res) {
+            uint64_t since = 0;
+            if (req.has_param("since")) {
+                try {
+                    since = static_cast<uint64_t>(std::stoull(req.get_param_value("since")));
+                } catch (...) {
+                    since = 0;
+                }
+            }
+
+            std::lock_guard<std::mutex> lk(mtx_);
+            json out = json::array();
+            for (const auto& ev : events_) {
+                if (ev["seq"].get<uint64_t>() > since) {
+                    out.push_back(ev);
+                }
+            }
+
+            app::reply_json(res, 200, {
+                {"events", out},
+                {"latestSeq", seq_}
+            });
+        });
+
+        std::cout << "[GroundControl] listening on 0.0.0.0:" << port << '\n';
+        std::cout << "[GroundControl] panel: " << panelHost_ << ":" << panelPort_
+                  << ", followme: " << fmHost_ << ":" << fmPort_ << '\n';
+
+        svr.listen("0.0.0.0", port);
+    }
+
+private:
+    bool edge_allows_mode(const Edge& e, const std::string& mode) const {
+        return e.type.find(mode) != std::string::npos;
+    }
+
+    bool node_has_slot_unsafe(const std::string& node) {
+        auto nIt = nodes_.find(node);
+        if (nIt == nodes_.end()) return false;
+        const int cap = nIt->second.capacity;
+        const int occ = static_cast<int>(nodeOcc_[node].size());
+        return occ < cap;
+    }
+
+    bool edge_has_slot_unsafe(const std::string& edge) {
+        auto eIt = edges_.find(edge);
+        if (eIt == edges_.end()) return false;
+        const int cap = eIt->second.capacity;
+        const int occ = static_cast<int>(edgeOcc_[edge].size());
+        return occ < cap;
+    }
+
+    std::optional<std::string> find_edge_between_unsafe(
+        const std::string& a,
+        const std::string& b,
+        const std::string& mode
+    ) {
+        if (!adjacency_.count(a)) return std::nullopt;
+        for (const auto& edgeName : adjacency_[a]) {
+            const auto& e = edges_.at(edgeName);
+            const bool match = (e.node1 == a && e.node2 == b) || (e.node1 == b && e.node2 == a);
+            if (match && edge_allows_mode(e, mode)) {
+                return edgeName;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::vector<std::string> shortest_path_nodes_unsafe(
+        const std::string& start,
+        const std::string& goal,
+        const std::string& mode
+    ) {
+        if (nodes_.count(start) == 0 || nodes_.count(goal) == 0) {
+            return {};
+        }
+        if (start == goal) {
+            return {start};
+        }
+
+        std::queue<std::string> q;
+        std::unordered_map<std::string, std::string> prev;
+        std::unordered_set<std::string> vis;
+
+        q.push(start);
+        vis.insert(start);
+
+        bool found = false;
+
+        while (!q.empty() && !found) {
+            auto cur = q.front();
+            q.pop();
+
+            if (!adjacency_.count(cur)) continue;
+
+            for (const auto& edgeName : adjacency_[cur]) {
+                const auto& e = edges_.at(edgeName);
+                if (!edge_allows_mode(e, mode)) continue;
+
+                const std::string next = (e.node1 == cur) ? e.node2 : e.node1;
+                if (!vis.count(next)) {
+                    vis.insert(next);
+                    prev[next] = cur;
+                    if (next == goal) {
+                        found = true;
+                        break;
+                    }
+                    q.push(next);
+                }
+            }
+        }
+
+        if (!found) {
+            return {};
+        }
+
+        std::vector<std::string> path;
+        for (std::string at = goal; !at.empty();) {
+            path.push_back(at);
+            auto it = prev.find(at);
+            if (it == prev.end()) break;
+            at = it->second;
+        }
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    std::string choose_free_parking_unsafe() {
+        // Choose nearest reachable from RE-1 (plane path), not reserved, and with node slot
+        std::string best;
+        size_t bestLen = std::numeric_limits<size_t>::max();
+
+        for (const auto& [name, n] : nodes_) {
+            if (n.type != "planeParking") continue;
+            if (reservedParking_.count(name)) continue;
+            if (!node_has_slot_unsafe(name)) continue;
+
+            auto path = shortest_path_nodes_unsafe("RE-1", name, "planeRoad");
+            if (path.empty()) continue;
+
+            if (path.size() < bestLen) {
+                bestLen = path.size();
+                best = name;
+            }
+        }
+        return best;
+    }
+
+    void push_event_unsafe(const std::string& type, const json& payload) {
+        ++seq_;
+        events_.push_back({
+            {"seq", seq_},
+            {"ts", app::now_sec()},
+            {"type", type},
+            {"payload", payload}
+        });
+
+        // simple retention
+        if (events_.size() > 10000) {
+            events_.erase(events_.begin(), events_.begin() + 2000);
+        }
+    }
+
+    void notify_panel_status(const std::string& flightId, const std::string& status, const std::string& reason) {
+        (void)app::http_post_json(panelHost_, panelPort_, "/v1/flights/status", {
+            {"flightId", flightId},
+            {"status", status},
+            {"reason", reason}
+        });
+    }
+
+private:
+    std::unordered_map<std::string, Node> nodes_;
+    std::unordered_map<std::string, Edge> edges_;
+    std::unordered_map<std::string, std::vector<std::string>> adjacency_;
+
+    std::unordered_map<std::string, std::unordered_set<std::string>> nodeOcc_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> edgeOcc_;
+    std::unordered_map<std::string, VehiclePos> vehiclePos_;
+
+    std::unordered_map<std::string, FlightSession> sessions_;
+    std::unordered_set<std::string> reservedParking_;
+
+    uint64_t seq_ = 0;
+    std::vector<json> events_;
+
+    std::mutex mtx_;
+
+    std::string panelHost_;
+    int panelPort_;
+    std::string fmHost_;
+    int fmPort_;
+};
+
+int main(int argc, char** argv) {
+    int port = 8081;
+    std::string mapPath = "/home/user/dir/programming/C++/Yaroslava/Airport/data/airport_map.json";
+
+    std::string panelHost = "localhost";
+    int panelPort = 8082;
+
+    std::string fmHost = "localhost";
+    int fmPort = 8083;
+
+    if (argc > 1) port = std::stoi(argv[1]);
+    if (argc > 2) mapPath = argv[2];
+
+    GroundControl gc(panelHost, panelPort, fmHost, fmPort);
+    if (!gc.load_map(mapPath)) {
+        return 1;
+    }
+
+    gc.run(port);
+    return 0;
+}
