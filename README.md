@@ -88,6 +88,7 @@ GET /health
 1. Information Panel
 2. Ground Control
 3. FollowMe
+4. Board
 
 ## Порядок действий 
 ### I. Инициализация системы
