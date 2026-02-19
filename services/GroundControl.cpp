@@ -417,21 +417,21 @@ public:
                 }
                 planeNode = *pn;
 
-                // 3) RE-1 должен быть свободен для взлета (мы будем резервировать его)
+                // 3) RW-1 должен быть свободен для взлета (мы будем резервировать его)
                 // idempotent: если уже зарезервировали под этот flight
-                if (nodeOcc_["RE-1"].count("takeoff_reservation:" + flightId) > 0)
+                if (nodeOcc_[kTakeoffNode].count("takeoff_reservation:" + flightId) > 0)
                 {
                     app::reply_json(res, 200, {
                                         {"flightId", flightId},
                                         {"allowed", true},
                                         {"reason", "already_reserved"},
                                         {"from", planeNode},
-                                        {"runwayEntrance", "RE-1"}
+                                        {"runwayEntrance", kTakeoffNode}
                                     });
                     return;
                 }
 
-                if (!node_has_slot_unsafe("RE-1"))
+                if (!node_has_slot_unsafe(kTakeoffNode))
                 {
                     app::reply_json(res, 200, {
                                         {"flightId", flightId},
@@ -442,22 +442,22 @@ public:
                     return;
                 }
 
-                // резервируем RE-1 на время “выруливания/взлета”
-                nodeOcc_["RE-1"].insert("takeoff_reservation:" + flightId);
+                // резервируем RW-1 на время “выруливания/взлета”
+                nodeOcc_[kTakeoffNode].insert("takeoff_reservation:" + flightId);
 
                 push_event_unsafe("flight.takeoff_approved", {
                                       {"flightId", flightId},
                                       {"from", planeNode},
-                                      {"runwayEntrance", "RE-1"}
+                                      {"runwayEntrance", kTakeoffNode}
                                   });
             }
 
-            notify_panel_status(flightId, "TakeoffApproved", "re1_reserved_for_takeoff");
+            notify_panel_status(flightId, "TakeoffApproved", "rw1_reserved_for_takeoff");
             app::reply_json(res, 200, {
                                 {"flightId", flightId},
                                 {"allowed", true},
                                 {"from", planeNode},
-                                {"runwayEntrance", "RE-1"}
+                                {"runwayEntrance", kTakeoffNode}
                             });
         });
 
@@ -476,13 +476,14 @@ public:
             }
 
             // replace reservation in RE-1 by plane occupancy
-            nodeOcc_["RE-1"].erase("reservation:" + flightId);
-            if (!node_has_slot_unsafe("RE-1"))
+            nodeOcc_[kLandingNode].erase("reservation:" + flightId);
+            if (!node_has_plane_slot_unsafe_(kLandingNode))
             {
-                app::reply_json(res, 409, {{"error", "RE-1 full"}});
+                app::reply_json(res, 409, {{"error", "RE-1 already has a plane"}});
                 return;
             }
-            nodeOcc_["RE-1"].insert("plane:" + flightId);
+
+            nodeOcc_[kLandingNode].insert("plane:" + flightId);
 
             it->second.landed = true;
             it->second.status = "LandedAtRE1";
@@ -511,7 +512,7 @@ public:
 
                 nodeOcc_[fromNode].erase("plane:" + flightId);
                 reservedParking_.erase(fromNode);
-                nodeOcc_["RE-1"].erase("takeoff_reservation:" + flightId);
+                nodeOcc_[kTakeoffNode].erase("takeoff_reservation:" + flightId);
 
                 push_event_unsafe("flight.tookoff", {
                     {"flightId", flightId},
@@ -850,18 +851,37 @@ public:
                 parking = it->second.parkingNode;
                 reservedParking_.erase(parking);
 
-                // move plane RE-1 -> parking
-                nodeOcc_["RE-1"].erase("plane:" + flightId);
-                if (node_has_slot_unsafe(parking))
-                {
-                    nodeOcc_[parking].insert("plane:" + flightId);
+                // sanity
+                if (!nodes_.count(parking)) {
+                    push_event_unsafe("flight.arrived_parking_error", {
+                        {"flightId", flightId},
+                        {"parking", parking},
+                        {"reason", "unknown_parking_node"}
+                    });
+                    app::reply_json(res, 409, {{"error", "unknown parking node"}, {"parking", parking}});
+                    return;
                 }
-                it->second.status = "ArrivedParking";
 
+                // самолёт должен отобразиться на стойке независимо от того, что FollowMe ещё там
+                if (!node_has_plane_slot_unsafe_(parking) && nodeOcc_[parking].count("plane:" + flightId) == 0) {
+                    // редкий конфликт: на стойке уже другой самолёт
+                    push_event_unsafe("flight.arrived_parking_conflict", {
+                        {"flightId", flightId},
+                        {"parking", parking},
+                        {"reason", "parking_already_has_plane"}
+                    });
+                    // можно решить по-разному; безопасно — не двигать
+                    app::reply_json(res, 409, {{"error", "parking already has a plane"}, {"parking", parking}});
+                    return;
+                }
+
+                place_plane_unsafe_(flightId, parking);
+
+                it->second.status = "ArrivedParking";
                 push_event_unsafe("flight.arrived_parking", {
-                                      {"flightId", flightId},
-                                      {"parking", parking}
-                                  });
+                    {"flightId", flightId},
+                    {"parking", parking}
+                });
             }
 
             notify_panel_status(flightId, "ArrivedParking", "plane_on_stand", parking);
@@ -1020,7 +1040,7 @@ private:
         auto nIt = nodes_.find(node);
         if (nIt == nodes_.end()) return false;
         const int cap = nIt->second.capacity;
-        const int occ = static_cast<int>(nodeOcc_[node].size());
+        const int occ = node_occ_for_capacity_unsafe_(node);
         return occ < cap;
     }
 
@@ -1122,7 +1142,6 @@ private:
 
     std::string choose_free_parking_unsafe()
     {
-        // Choose nearest reachable from RE-1 (plane path), not reserved, and with node slot
         std::string best;
         size_t bestLen = std::numeric_limits<size_t>::max();
 
@@ -1130,9 +1149,14 @@ private:
         {
             if (n.type != "planeParking") continue;
             if (reservedParking_.count(name)) continue;
+
+            // ВАЖНО: стойка должна быть свободна от самолёта
+            if (!node_has_plane_slot_unsafe_(name)) continue;
+
+            // и не должна быть забита “не самолётными” объектами (vehicle/reservation)
             if (!node_has_slot_unsafe(name)) continue;
 
-            auto path = shortest_path_nodes_unsafe("RE-1", name, "planeRoad");
+            auto path = shortest_path_nodes_unsafe(kLandingNode, name, "planeRoad");
             if (path.empty()) continue;
 
             if (path.size() < bestLen)
@@ -1201,53 +1225,6 @@ private:
         auto it = nodes_.find(node);
         if (it == nodes_.end()) return false;
         return it->second.type == "planeParking";
-    }
-
-
-    static bool is_ground_status(const std::string& s)
-    {
-        return s == "ArrivedParking" || s == "Parked" || s == "OnStand";
-    }
-
-    static bool is_air_status(const std::string& s)
-    {
-        return s == "Scheduled" || s == "Delayed" || s == "LandingApproved" || s == "Airborne";
-    }
-
-    static bool is_terminal_status(const std::string& s)
-    {
-        return s == "Departed" || s == "Cancelled" || s == "Denied";
-    }
-
-    void spawn_board_airborne(const std::string& flightId)
-    {
-        (void)app::http_post_json(boardHost_, boardPort_, "/v1/planes/airborne", {
-                                      {"flightId", flightId},
-                                      {"gcHost", "localhost"},
-                                      {"gcPort", 8081},
-                                      {"pollSec", 5},
-                                      {"touchdownDelaySec", 2}
-                                  });
-    }
-
-    void spawn_board_grounded(const std::string& flightId, const std::string& parkingNode)
-    {
-        (void)app::http_post_json(boardHost_, boardPort_, "/v1/planes/grounded", {
-                                      {"flightId", flightId},
-                                      {"parkingNode", parkingNode},
-                                      {"gcHost", "localhost"},
-                                      {"gcPort", 8081},
-                                      {"pollSec", 3},
-                                      {"handlingSec", 10},
-                                      {"takeoffDelaySec", 2}
-                                  });
-    }
-
-    void stop_board_plane(const std::string& flightId)
-    {
-        (void)app::http_post_json(boardHost_, boardPort_, "/v1/planes/stop", {
-                                      {"flightId", flightId}
-                                  });
     }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1329,69 +1306,51 @@ private:
     }
 
 ///////////////////////////////////////////////////////////////////////////////
-
-    bool can_try_board_now_(const std::string& flightId) {
-        const int64_t now = app::now_sec();
-        auto it = boardSpawnRetryAfter_.find(flightId);
-        return (it == boardSpawnRetryAfter_.end() || now >= it->second);
-    }
-
-    void on_board_spawn_fail_(const std::string& flightId, const std::string& kind, const std::string& reason) {
-        const int64_t now = app::now_sec();
-        int& att = boardSpawnAttempts_[flightId];
-        att = std::min(att + 1, 10);
-
-        // 1,2,4,8,16,30... (кап 30 сек)
-        int delay = 1 << std::min(att, 5);
-        delay = std::min(delay, 30);
-
-        boardSpawnRetryAfter_[flightId] = now + delay;
-
-        push_event_unsafe("board.spawn_failed", {
-            {"flightId", flightId},
-            {"kind", kind},
-            {"reason", reason},
-            {"retryInSec", delay}
-        });
-    }
-
-    void on_board_spawn_ok_(const std::string& flightId, const std::string& kind) {
-        boardSpawnAttempts_.erase(flightId);
-        boardSpawnRetryAfter_.erase(flightId);
-
-        push_event_unsafe("board.spawn_ok", {
-            {"flightId", flightId},
-            {"kind", kind}
-        });
-    }
-
     void start_panel_sync_thread_()
     {
         panelSyncStop_.store(false);
+        panelInitDone_.store(false);
+        boardInitDone_.store(false);
 
         panelSyncThread_ = std::thread([this]()
         {
-            while (!panelSyncStop_.load())
+            while (!panelSyncStop_.load() && !boardInitDone_.load())
             {
                 try
                 {
-                    sync_from_panel_once_();
+                    if (!panelInitDone_.load())
+                    {
+                        // Фаза 1: только до первого успешного непустого списка
+                        if (sync_from_panel_once_()) {
+                            panelInitDone_.store(true);
+                        }
+                        std::this_thread::sleep_for(std::chrono::seconds(panelSyncPeriodSec_));
+                    }
+                    else
+                    {
+                        // Фаза 2: НЕ ходим в Panel, но ретраим Board до ACK по всем
+                        if (retry_board_init_once_()) {
+                            boardInitDone_.store(true);
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
                 }
                 catch (...)
                 {
-                    // просто игнорируем, чтобы поток не умер
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(panelSyncPeriodSec_));
             }
         });
 
-        panelSyncThread_.detach(); // для MVP достаточно
+        panelSyncThread_.detach();
     }
 
-    void sync_from_panel_once_() {
+
+    bool sync_from_panel_once_() {
         const std::string path = panelFlightsListPath_ + "?ts=" + std::to_string(app::now_sec());
         auto r = app::http_get_json(panelHost_, panelPort_, path);
-        if (!r.ok()) return;
+        if (!r.ok()) return false;
 
         json flightsJson;
         if (r.body.is_object() && r.body.contains("flights") && r.body["flights"].is_array()) {
@@ -1399,7 +1358,12 @@ private:
         } else if (r.body.is_array()) {
             flightsJson = r.body;
         } else {
-            return;
+            return false;
+        }
+
+        // “до первого успешного получения самолетов” — проверяем, что есть хотя бы один
+        if (flightsJson.empty()) {
+            return false;
         }
 
         struct Action {
@@ -1502,6 +1466,8 @@ private:
                         placed = true;
                     }
 
+                    desiredInBoard_[flightId] = DesiredPlane{"grounded", stand};
+
                     // ВАЖНО: НЕ помечаем spawnedInBoard_ заранее. Только планируем action.
                     if (placed) {
                         const std::string curKind = spawnedInBoard_.count(flightId) ? spawnedInBoard_[flightId] : "";
@@ -1521,6 +1487,7 @@ private:
                         continue;
                     }
 
+                    desiredInBoard_[flightId] = DesiredPlane{"airborne", ""};
                     const std::string curKind = spawnedInBoard_.count(flightId) ? spawnedInBoard_[flightId] : "";
                     if (curKind != "airborne") {
                         const std::string key = board_key_(flightId, "airborne");
@@ -1567,8 +1534,108 @@ private:
                 board_fail_unsafe_(key, a.flightId, a.kind, "http_or_ok_false");
             }
         }
+
+        return true;
     }
 
+    bool retry_board_init_once_()
+    {
+        struct Action {
+            std::string kind;      // "airborne" | "grounded"
+            std::string flightId;
+            std::string parkingNode;
+        };
+        std::vector<Action> actions;
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+
+            for (const auto& [flightId, d] : desiredInBoard_) {
+                const std::string curKind = spawnedInBoard_.count(flightId) ? spawnedInBoard_[flightId] : "";
+                if (curKind == d.kind) continue;
+
+                const std::string key = board_key_(flightId, d.kind);
+                if (!can_try_board_now_unsafe_(key)) continue;
+
+                actions.push_back({d.kind, flightId, d.parkingNode});
+            }
+        }
+
+        // HTTP снаружи mutex + update по ACK
+        for (const auto& a : actions) {
+            bool ok = false;
+
+            if (a.kind == "airborne") ok = spawn_board_airborne_ack_(a.flightId);
+            else                      ok = spawn_board_grounded_ack_(a.flightId, a.parkingNode);
+
+            std::lock_guard<std::mutex> lk(mtx_);
+            const std::string key = board_key_(a.flightId, a.kind);
+
+            if (ok) {
+                spawnedInBoard_[a.flightId] = a.kind;
+                board_ok_unsafe_(key, a.flightId, a.kind);
+            } else {
+                board_fail_unsafe_(key, a.flightId, a.kind, "http_or_ok_false");
+            }
+        }
+
+        // Проверяем: всё ли подтверждено
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (const auto& [flightId, d] : desiredInBoard_) {
+                auto it = spawnedInBoard_.find(flightId);
+                if (it == spawnedInBoard_.end() || it->second != d.kind) return false;
+            }
+        }
+        return true;
+    }
+
+    static constexpr const char* kLandingNode = "RE-1";
+    static constexpr const char* kTakeoffNode = "RW-1";
+
+    static bool has_prefix_(const std::string& s, const char* p) {
+        return s.rfind(p, 0) == 0;
+    }
+
+    // Для capacity на planeParking не считаем plane:* (чтобы vehicle мог стоять вместе с самолётом)
+    int node_occ_for_capacity_unsafe_(const std::string& node) {
+        auto nIt = nodes_.find(node);
+        if (nIt == nodes_.end()) return 0;
+
+        const auto& occ = nodeOcc_[node];
+
+        if (nIt->second.type == "planeParking") {
+            int cnt = 0;
+            for (const auto& t : occ) {
+                if (!has_prefix_(t, "plane:")) cnt++;
+            }
+            return cnt;
+        }
+
+        return static_cast<int>(occ.size());
+    }
+
+    // “Самолётный слот”: по умолчанию 1 plane:* на узел
+    bool node_has_plane_slot_unsafe_(const std::string& node) {
+        int planes = 0;
+        for (const auto& t : nodeOcc_[node]) {
+            if (has_prefix_(t, "plane:")) planes++;
+        }
+        return planes < 1;
+    }
+
+    // Надёжно перемещаем plane:* (не зависит от того, где он сейчас)
+    void place_plane_unsafe_(const std::string& flightId, const std::string& targetNode) {
+        const std::string token = "plane:" + flightId;
+
+        // убираем “plane:flightId” отовсюду (на случай рассинхрона)
+        for (auto& [node, occ] : nodeOcc_) {
+            occ.erase(token);
+        }
+
+        // ставим в нужный узел
+        nodeOcc_[targetNode].insert(token);
+    }
 
 
 private:
@@ -1582,9 +1649,6 @@ private:
 
     std::unordered_map<std::string, FlightSession> sessions_;
     std::unordered_set<std::string> reservedParking_;
-
-    std::unordered_map<std::string, int> boardSpawnAttempts_;
-    std::unordered_map<std::string, int64_t> boardSpawnRetryAfter_; // unix sec
 
     std::unordered_map<std::string, int> boardAttempt_;
     std::unordered_map<std::string, int64_t> boardRetryAfter_;
@@ -1607,6 +1671,16 @@ private:
     std::thread panelSyncThread_;
     int panelSyncPeriodSec_ = 5;
     std::string panelFlightsListPath_ = "/v1/flights"; // должен возвращать список
+
+    std::atomic<bool> panelInitDone_{false};
+
+    struct DesiredPlane {
+        std::string kind;        // "airborne" | "grounded"
+        std::string parkingNode; // только для grounded
+    };
+
+    std::unordered_map<std::string, DesiredPlane> desiredInBoard_; // то, что ДОЛЖНО быть создано в Board
+    std::atomic<bool> boardInitDone_{false};
 
     // чтобы не спавнить самолеты повторно
     // value: "airborne" или "grounded"
