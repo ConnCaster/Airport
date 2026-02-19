@@ -6,8 +6,14 @@
 GET /v1/land_permission?flightId=...
     Запрос разрешения на посадку (Board -> GroundControl)
     
+GET /v1/takeoff_permission?flightId=...    
+   Запрос разрешения на взлет (Board -> GroundControl)
+    
 POST /v1/flights/{flightId}/landed
     Информирование о посадке в RE-1 ноду карты аэропорта (Board -> GroundControl)
+      
+POST /v1/flights/{flightId}/tookoff
+    Информирование о фактическом взлете (Board -> GroundControl) 
       
 POST /v1/vehicles/init
     Информирование о всех созданных машинках FollowMe, чтобы отрисовать их на карте (FollowMe -> GroundControl)
@@ -53,7 +59,7 @@ GET /v1/flights/{flightId}?ts=...
 POST /v1/flights/status
     Изменение статуса рейса (ожидаем, сел, взлетел и так далее) (GroundControl -> Information Table)
 
-* GET /v1/flights (не используется)
+GET /v1/flights
     Запрос всех запланированных рейсов (GroundControl -> Information Table)
 ```
 

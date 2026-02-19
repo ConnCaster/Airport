@@ -1,14 +1,16 @@
-include <atomic>
+#include <atomic>
 #include <chrono>
+#include <cctype>      // <-- isalnum
 #include <iomanip>
 #include <iostream>
+#include <memory>      // <-- unique_ptr, make_unique
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
-#include "common.h" // то же, что у тебя в GC: app::reply_json, app::http_get_json, app::http_post_json, app::now_sec, app::parse_json_body, app::s_or
+#include "common.h"
 
 using app::json;
 
@@ -18,7 +20,7 @@ std::string url_encode(const std::string& s) {
     std::ostringstream out;
     out << std::hex << std::uppercase;
     for (unsigned char c : s) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+        if (std::isalnum(static_cast<int>(c)) || c == '-' || c == '_' || c == '.' || c == '~') {
             out << c;
         } else {
             out << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
@@ -76,15 +78,15 @@ public:
                 return;
             }
 
-            Agent a;
-            a.flightId = flightId;
-            a.kind = "airborne";
-            a.state = "created";
-            a.startedAt = app::now_sec();
-            a.gcHost = body.value("gcHost", std::string("localhost"));
-            a.gcPort = body.value("gcPort", 8081);
-            a.pollSec = body.value("pollSec", 30);
-            a.actionDelaySec = body.value("touchdownDelaySec", 2);
+            auto a = std::make_unique<Agent>();
+            a->flightId = flightId;
+            a->kind = "airborne";
+            a->state = "created";
+            a->startedAt = app::now_sec();
+            a->gcHost = body.value("gcHost", std::string("localhost"));
+            a->gcPort = body.value("gcPort", 8081);
+            a->pollSec = body.value("pollSec", 30);
+            a->actionDelaySec = body.value("touchdownDelaySec", 2);
 
             const bool ok = start_or_replace_agent(std::move(a));
             app::reply_json(res, ok ? 200 : 500, {
@@ -113,17 +115,17 @@ public:
                 return;
             }
 
-            Agent a;
-            a.flightId = flightId;
-            a.kind = "grounded";
-            a.state = "created";
-            a.startedAt = app::now_sec();
-            a.gcHost = body.value("gcHost", std::string("localhost"));
-            a.gcPort = body.value("gcPort", 8081);
-            a.pollSec = body.value("pollSec", 10);
-            a.handlingSec = body.value("handlingSec", 15);
-            a.actionDelaySec = body.value("takeoffDelaySec", 2);
-            a.parkingNode = parkingNode;
+            auto a = std::make_unique<Agent>();
+            a->flightId = flightId;
+            a->kind = "grounded";
+            a->state = "created";
+            a->startedAt = app::now_sec();
+            a->gcHost = body.value("gcHost", std::string("localhost"));
+            a->gcPort = body.value("gcPort", 8081);
+            a->pollSec = body.value("pollSec", 10);
+            a->handlingSec = body.value("handlingSec", 15);
+            a->actionDelaySec = body.value("takeoffDelaySec", 2);
+            a->parkingNode = parkingNode;
 
             const bool ok = start_or_replace_agent(std::move(a));
             app::reply_json(res, ok ? 200 : 500, {
@@ -173,13 +175,13 @@ public:
         std::cout << "[Board] listening on 0.0.0.0:" << port << "\n";
         svr.listen("0.0.0.0", port);
 
-        // graceful stop (if server stops)
         stop_all();
     }
 
 private:
-    bool start_or_replace_agent(Agent a) {
-        std::unique_ptr<Agent> ptr = std::make_unique<Agent>(std::move(a));
+    bool start_or_replace_agent(std::unique_ptr<Agent> ptr) {
+        if (!ptr || ptr->flightId.empty()) return false;
+
         const std::string flightId = ptr->flightId;
 
         // stop existing
@@ -192,19 +194,21 @@ private:
         }
         join_and_erase(flightId);
 
-        // start new    (thread uses raw pointer stable in map)
+        // insert new
+        Agent* ap = ptr.get();
         {
             std::lock_guard<std::mutex> lk(mtx_);
             agents_[flightId] = std::move(ptr);
-            Agent* ap = agents_[flightId].get();
-            ap->th = std::thread([this, ap]() {
-                if (ap->kind == "airborne") {
-                    run_airborne(*ap);
-                } else {
-                    run_grounded(*ap);
-                }
-            });
         }
+
+        // start thread (agent object already owned by map)
+        ap->th = std::thread([this, ap]() {
+            if (ap->kind == "airborne") {
+                run_airborne(*ap);
+            } else {
+                run_grounded(*ap);
+            }
+        });
 
         return true;
     }
@@ -236,7 +240,6 @@ private:
             auto rr = app::http_post_json(a.gcHost, a.gcPort, landedPath, json::object());
             if (!rr.ok()) {
                 a.lastError = "failed to POST landed";
-                // продолжим ретраи, чтобы не “потерять посадку”
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 continue;
             }
@@ -249,11 +252,9 @@ private:
     }
 
     void run_grounded(Agent& a) {
-        // HandlingSuperviser stub: делаем вид, что обслуживание идет
         a.state = "grounded.request_handling_stub";
 
-        // Заглушка "вызова" handling supervisor (не обязателен, но демонстрирует контракт)
-        // Если сервиса нет — это не ошибка, мы просто симулируем ожидание.
+        // HandlingSupervisor stub (если сервиса нет — это не ошибка)
         (void)app::http_post_json("localhost", 8085, "/v1/handling/request", {
             {"flightId", a.flightId},
             {"parkingNode", a.parkingNode},
@@ -325,8 +326,7 @@ private:
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = agents_.find(flightId);
             if (it == agents_.end()) return;
-            // забираем владение, чтобы join делать вне map
-            victim = std::move(it->second);
+            victim = std::move(it->second); // забираем владение
             agents_.erase(it);
         }
 
