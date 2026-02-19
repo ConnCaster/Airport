@@ -289,19 +289,37 @@ private:
                 continue;
             }
 
-            a.state = "grounded.takeoff_approved";
-            std::this_thread::sleep_for(std::chrono::seconds(a.actionDelaySec));
+            // разрешили взлет — ПОКА НИЧЕГО НЕ ДЕЛАЕМ (как ты попросила)
+            a.state = "grounded.takeoff_approved_noop";
+            a.lastError.clear();
 
-            const std::string tookoffPath = "/v1/flights/" + url_encode(a.flightId) + "/tookoff";
-            auto rr = app::http_post_json(a.gcHost, a.gcPort, tookoffPath, json::object());
-            if (!rr.ok()) {
-                a.lastError = "failed to POST tookoff";
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
+            // просто остаёмся живыми до stop (или можешь return, если хочешь авто-завершение)
+            while (!a.stop.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-
-            a.state = "grounded.tookoff_notified";
+            a.state = "stopped";
             return;
+
+            // const bool allowed = r.body.value("allowed", false);
+            // if (!allowed) {
+            //     a.state = std::string("grounded.takeoff_denied:") + r.body.value("reason", "");
+            //     std::this_thread::sleep_for(std::chrono::seconds(a.pollSec));
+            //     continue;
+            // }
+            //
+            // a.state = "grounded.takeoff_approved";
+            // std::this_thread::sleep_for(std::chrono::seconds(a.actionDelaySec));
+            //
+            // const std::string tookoffPath = "/v1/flights/" + url_encode(a.flightId) + "/tookoff";
+            // auto rr = app::http_post_json(a.gcHost, a.gcPort, tookoffPath, json::object());
+            // if (!rr.ok()) {
+            //     a.lastError = "failed to POST tookoff";
+            //     std::this_thread::sleep_for(std::chrono::seconds(2));
+            //     continue;
+            // }
+            //
+            // a.state = "grounded.tookoff_notified";
+            // return;
         }
 
         a.state = "stopped";
