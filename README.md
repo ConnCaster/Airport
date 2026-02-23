@@ -61,6 +61,9 @@ POST /v1/flights/status
 
 GET /v1/flights
     Запрос всех запланированных рейсов (GroundControl -> Information Table)
+    
+GET /health
+    Проверка, что сервис запустился (* -> Information Table)
 ```
 
 ### 3. FollowMe (порт 8083)
@@ -83,6 +86,26 @@ POST /v1/vehicles/release
 
 GET /health
     Проверка, что сервис запустился (* -> FollowMe)
+```
+
+### 3. Board (порт 8084)
+
+```
+POST /v1/planes/airborne
+    Создание агента самолета в воздухе (Board начинает опрашивать GroundControl на разрешение посадки) (GroundControl -> Board)
+
+POST /v1/planes/grounded
+    Создание агента самолета на земле (на парковке), который имитирует обслуживание и опрашивает GroundControl на разрешение взлета (GroundControl -> Board)
+
+POST /v1/planes/stop
+    Остановка агента самолета по flightId (например, если рейс завершен/отменен) (GroundControl -> Board)
+
+* GET /v1/planes (не используется)
+    Получение списка активных агентов самолетов и их состояния (диагностика) (* -> Board)
+
+GET /health
+    Проверка, что сервис запустился
+    (* -> Board)
 ```
 
 Списки атрибутов для POST-запросов искать в коде.
@@ -151,3 +174,8 @@ P.S.:
 4. *Получив разрешение, разрешает Board взлет
 5. *_Будем думать о взлете позже_*
 
+## Запуск сервисов в Docker
+```shell
+sudo docker compose down -v
+sudo docker compose up
+```
