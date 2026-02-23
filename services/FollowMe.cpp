@@ -4,6 +4,11 @@
 #include <chrono>
 #include <iostream>
 #include <vector>
+#include <string>
+#include <cstdlib>
+#include <stdexcept>
+
+#include <pqxx/pqxx>
 
 #include "common.h"
 
@@ -16,12 +21,124 @@ struct Vehicle {
     std::string flightId;
 };
 
+class VehicleRepository {
+public:
+    explicit VehicleRepository(std::string connStr)
+        : connStr_(std::move(connStr)) {}
+
+    void ensure_schema() {
+        pqxx::connection cx(connStr_);
+        pqxx::work tx(cx);
+
+        tx.exec(R"sql(
+            CREATE TABLE IF NOT EXISTS followme_vehicles (
+                vehicle_id   TEXT PRIMARY KEY,
+                current_node TEXT NOT NULL DEFAULT 'FS-1',
+                status       TEXT NOT NULL DEFAULT 'empty',
+                flight_id    TEXT NULL,
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT chk_followme_status CHECK (
+                    status IN ('empty', 'reserved', 'moveToLandingPosition', 'movingWithPlane', 'returning')
+                )
+            );
+        )sql");
+
+        tx.exec(R"sql(
+            CREATE INDEX IF NOT EXISTS idx_followme_status ON followme_vehicles(status);
+        )sql");
+
+        tx.commit();
+    }
+
+    std::vector<Vehicle> load_all() {
+        pqxx::connection cx(connStr_);
+        pqxx::work tx(cx);
+
+        pqxx::result r = tx.exec(R"sql(
+            SELECT
+                vehicle_id,
+                current_node,
+                status,
+                COALESCE(flight_id, '') AS flight_id
+            FROM followme_vehicles
+            ORDER BY vehicle_id
+        )sql");
+
+        std::vector<Vehicle> out;
+        out.reserve(r.size());
+
+        for (const auto& row : r) {
+            Vehicle v;
+            v.vehicleId = row["vehicle_id"].as<std::string>();
+            v.currentNode = row["current_node"].as<std::string>();
+            v.status = row["status"].as<std::string>();
+            v.flightId = row["flight_id"].as<std::string>();
+            out.push_back(std::move(v));
+        }
+
+        tx.commit();
+        return out;
+    }
+
+    void upsert_many(const std::vector<Vehicle>& vehicles) {
+        if (vehicles.empty()) return;
+
+        pqxx::connection cx(connStr_);
+        pqxx::work tx(cx);
+
+        for (const auto& v : vehicles) {
+            tx.exec_params(R"sql(
+                INSERT INTO followme_vehicles (vehicle_id, current_node, status, flight_id, updated_at)
+                VALUES ($1, $2, $3, NULLIF($4, ''), NOW())
+                ON CONFLICT (vehicle_id) DO UPDATE SET
+                    current_node = EXCLUDED.current_node,
+                    status = EXCLUDED.status,
+                    flight_id = EXCLUDED.flight_id,
+                    updated_at = NOW()
+            )sql", v.vehicleId, v.currentNode, v.status, v.flightId);
+        }
+
+        tx.commit();
+    }
+
+    void upsert_one(const Vehicle& v) {
+        pqxx::connection cx(connStr_);
+        pqxx::work tx(cx);
+
+        tx.exec_params(R"sql(
+            INSERT INTO followme_vehicles (vehicle_id, current_node, status, flight_id, updated_at)
+            VALUES ($1, $2, $3, NULLIF($4, ''), NOW())
+            ON CONFLICT (vehicle_id) DO UPDATE SET
+                current_node = EXCLUDED.current_node,
+                status = EXCLUDED.status,
+                flight_id = EXCLUDED.flight_id,
+                updated_at = NOW()
+        )sql", v.vehicleId, v.currentNode, v.status, v.flightId);
+
+        tx.commit();
+    }
+
+private:
+    std::string connStr_;
+};
+
 class FollowMeService {
 public:
-    FollowMeService(std::string gcHost, int gcPort)
-        : gcHost_(std::move(gcHost)), gcPort_(gcPort) {}
+    FollowMeService(std::string gcHost, int gcPort, std::string pgConnStr)
+        : gcHost_(std::move(gcHost))
+        , gcPort_(gcPort)
+        , repo_(std::move(pgConnStr)) {}
 
     void run(int port) {
+        try {
+            repo_.ensure_schema();
+            load_vehicles_from_db();
+            sync_loaded_vehicles_to_ground_control();
+        } catch (const std::exception& e) {
+            std::cerr << "[FollowMe][DB] startup error: " << e.what() << '\n';
+            throw;
+        }
+
         httplib::Server svr;
 
         svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -32,6 +149,7 @@ public:
             });
         });
 
+        // API init: теперь не только в память, но и в БД
         svr.Post("/v1/vehicles/init", [&](const httplib::Request& req, httplib::Response& res) {
             auto bodyOpt = app::parse_json_body(req);
             if (!bodyOpt) {
@@ -45,20 +163,35 @@ public:
                 return;
             }
 
-            int initialized = 0;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                for (const auto& v : body["vehicles"]) {
-                    Vehicle vv;
-                    vv.vehicleId = app::s_or(v, "vehicleId");
-                    vv.currentNode = v.value("currentNode", std::string("FS-1"));
-                    vv.status = v.value("status", std::string("empty"));
-                    vv.flightId.clear();
+            std::vector<Vehicle> batch;
+            batch.reserve(body["vehicles"].size());
 
-                    if (vv.vehicleId.empty()) continue;
-                    vehicles_[vv.vehicleId] = vv;
-                    ++initialized;
+            for (const auto& v : body["vehicles"]) {
+                Vehicle vv;
+                vv.vehicleId = app::s_or(v, "vehicleId");
+                vv.currentNode = v.value("currentNode", std::string("FS-1"));
+                vv.status = v.value("status", std::string("empty"));
+                vv.flightId.clear();
+
+                if (vv.vehicleId.empty()) continue;
+                batch.push_back(std::move(vv));
+            }
+
+            try {
+                repo_.upsert_many(batch);
+
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    for (const auto& v : batch) {
+                        vehicles_[v.vehicleId] = v;
+                    }
                 }
+            } catch (const std::exception& e) {
+                app::reply_json(res, 500, {
+                    {"error", "db_error"},
+                    {"message", e.what()}
+                });
+                return;
             }
 
             // sync to GroundControl
@@ -66,7 +199,7 @@ public:
 
             app::reply_json(res, 200, {
                 {"ok", true},
-                {"initialized", initialized}
+                {"initialized", static_cast<int>(batch.size())}
             });
         });
 
@@ -75,6 +208,7 @@ public:
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 for (const auto& [id, v] : vehicles_) {
+                    (void)id;
                     if (v.status == "empty") ++cnt;
                 }
             }
@@ -100,16 +234,23 @@ public:
             }
 
             std::string picked;
-            {
+            try {
                 std::lock_guard<std::mutex> lk(mtx_);
                 for (auto& [id, v] : vehicles_) {
                     if (v.status == "empty") {
                         v.status = "reserved";
                         v.flightId = flightId;
+                        repo_.upsert_one(v); // persist
                         picked = id;
                         break;
                     }
                 }
+            } catch (const std::exception& e) {
+                app::reply_json(res, 500, {
+                    {"error", "db_error"},
+                    {"message", e.what()}
+                });
+                return;
             }
 
             if (picked.empty()) {
@@ -146,27 +287,36 @@ public:
                 return;
             }
 
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = vehicles_.find(vehicleId);
-            if (it == vehicles_.end()) {
-                app::reply_json(res, 404, {{"error", "vehicle not found"}});
-                return;
+            try {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = vehicles_.find(vehicleId);
+                if (it == vehicles_.end()) {
+                    app::reply_json(res, 404, {{"error", "vehicle not found"}});
+                    return;
+                }
+
+                it->second.status = "empty";
+                it->second.flightId.clear();
+                repo_.upsert_one(it->second);
+
+                app::reply_json(res, 200, {
+                    {"ok", true},
+                    {"vehicleId", vehicleId},
+                    {"status", "empty"}
+                });
+            } catch (const std::exception& e) {
+                app::reply_json(res, 500, {
+                    {"error", "db_error"},
+                    {"message", e.what()}
+                });
             }
-
-            it->second.status = "empty";
-            it->second.flightId.clear();
-
-            app::reply_json(res, 200, {
-                {"ok", true},
-                {"vehicleId", vehicleId},
-                {"status", "empty"}
-            });
         });
 
         svr.Get("/v1/vehicles", [&](const httplib::Request&, httplib::Response& res) {
             json arr = json::array();
             std::lock_guard<std::mutex> lk(mtx_);
             for (const auto& [id, v] : vehicles_) {
+                (void)id;
                 arr.push_back({
                     {"vehicleId", v.vehicleId},
                     {"status", v.status},
@@ -183,19 +333,68 @@ public:
     }
 
 private:
+    void load_vehicles_from_db() {
+        auto loaded = repo_.load_all();
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            vehicles_.clear();
+            for (const auto& v : loaded) {
+                vehicles_[v.vehicleId] = v;
+            }
+        }
+
+        std::cout << "[FollowMe][DB] loaded " << loaded.size() << " vehicles\n";
+    }
+
+    void sync_loaded_vehicles_to_ground_control() {
+        json arr = json::array();
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (const auto& [id, v] : vehicles_) {
+                (void)id;
+                arr.push_back({
+                    {"vehicleId", v.vehicleId},
+                    {"currentNode", v.currentNode},
+                    {"status", v.status}
+                });
+            }
+        }
+
+        if (arr.empty()) return;
+
+        auto res = app::http_post_json(gcHost_, gcPort_, "/v1/vehicles/init", {
+            {"vehicles", arr}
+        });
+
+        if (!res.ok()) {
+            std::cerr << "[FollowMe] warning: failed to sync loaded vehicles to GroundControl\n";
+        }
+    }
+
     void set_vehicle_status(const std::string& vehicleId, const std::string& status) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = vehicles_.find(vehicleId);
-        if (it != vehicles_.end()) {
-            it->second.status = status;
+        try {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = vehicles_.find(vehicleId);
+            if (it != vehicles_.end()) {
+                it->second.status = status;
+                repo_.upsert_one(it->second);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[FollowMe][DB] set_vehicle_status failed: " << e.what() << '\n';
         }
     }
 
     void set_vehicle_node(const std::string& vehicleId, const std::string& node) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = vehicles_.find(vehicleId);
-        if (it != vehicles_.end()) {
-            it->second.currentNode = node;
+        try {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = vehicles_.find(vehicleId);
+            if (it != vehicles_.end()) {
+                it->second.currentNode = node;
+                repo_.upsert_one(it->second);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[FollowMe][DB] set_vehicle_node failed: " << e.what() << '\n';
         }
     }
 
@@ -230,7 +429,6 @@ private:
                     break;
                 }
 
-                // wait in node
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
@@ -250,7 +448,6 @@ private:
                     break;
                 }
 
-                // wait on edge
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }
@@ -263,11 +460,16 @@ private:
         auto missionRes = app::http_get_json(gcHost_, gcPort_, "/v1/map/followme/path?flightId=" + flightId);
         if (!missionRes.ok()) {
             // release vehicle
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = vehicles_.find(vehicleId);
-            if (it != vehicles_.end()) {
-                it->second.status = "empty";
-                it->second.flightId.clear();
+            try {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = vehicles_.find(vehicleId);
+                if (it != vehicles_.end()) {
+                    it->second.status = "empty";
+                    it->second.flightId.clear();
+                    repo_.upsert_one(it->second);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[FollowMe][DB] worker rollback failed: " << e.what() << '\n';
             }
             return;
         }
@@ -309,13 +511,16 @@ private:
         (void)drive_route(vehicleId, flightId, routeReturn);
 
         // 7) done => empty
-        {
+        try {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = vehicles_.find(vehicleId);
             if (it != vehicles_.end()) {
                 it->second.status = "empty";
                 it->second.flightId.clear();
+                repo_.upsert_one(it->second);
             }
+        } catch (const std::exception& e) {
+            std::cerr << "[FollowMe][DB] final persist failed: " << e.what() << '\n';
         }
 
         (void)app::http_post_json(gcHost_, gcPort_, "/v1/followme/mission/completed", {
@@ -330,16 +535,46 @@ private:
 
     std::string gcHost_;
     int gcPort_;
+
+    VehicleRepository repo_;
 };
 
+static std::string env_or(const char* key, const std::string& defVal) {
+    const char* v = std::getenv(key);
+    return (v && *v) ? std::string(v) : defVal;
+}
+
 int main(int argc, char** argv) {
-    int port = 8083;
-    std::string gcHost = "localhost";
-    int gcPort = 8081;
+    try {
+        int port = 8083;
+        std::string gcHost = env_or("GC_HOST", "localhost");
+        int gcPort = std::stoi(env_or("GC_PORT", "8081"));
 
-    if (argc > 1) port = std::stoi(argv[1]);
+        if (argc > 1) port = std::stoi(argv[1]);
 
-    FollowMeService s(gcHost, gcPort);
-    s.run(port);
-    return 0;
+        // Можно передать одной строкой через FM_PG_DSN,
+        // либо собрать из отдельных переменных.
+        std::string pgConn = env_or("FM_PG_DSN", "");
+        if (pgConn.empty()) {
+            const std::string host = env_or("FM_PG_HOST", "127.0.0.1");
+            const std::string pgPort = env_or("FM_PG_PORT", "5432");
+            const std::string db = env_or("FM_PG_DB", "airport");
+            const std::string user = env_or("FM_PG_USER", "airport_user");
+            const std::string pass = env_or("FM_PG_PASSWORD", "airport_pass");
+
+            pgConn =
+                "host=" + host +
+                " port=" + pgPort +
+                " dbname=" + db +
+                " user=" + user +
+                " password=" + pass;
+        }
+
+        FollowMeService s(gcHost, gcPort, pgConn);
+        s.run(port);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[FollowMe] fatal: " << e.what() << '\n';
+        return 1;
+    }
 }
