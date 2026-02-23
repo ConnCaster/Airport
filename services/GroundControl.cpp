@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <optional>
+#include <cstdlib>
 
 #include "common.h"
 
@@ -50,18 +51,36 @@ struct FlightSession
     int64_t createdAt = 0;
 };
 
+static std::string env_or(const char* key, const std::string& defVal) {
+    const char* v = std::getenv(key);
+    return (v && *v) ? std::string(v) : defVal;
+}
+
+static int env_or_int(const char* key, int defVal) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return defVal;
+    try {
+        return std::stoi(v);
+    } catch (...) {
+        return defVal;
+    }
+}
+
 class GroundControl
 {
 public:
     GroundControl(std::string panelHost, int panelPort,
-                  std::string fmHost, int fmPort,
-                  std::string boardHost, int boardPort)
-        : panelHost_(std::move(panelHost)),
-          panelPort_(panelPort),
-          fmHost_(std::move(fmHost)),
-          fmPort_(fmPort),
-          boardHost_(std::move(boardHost)),
-          boardPort_(boardPort)
+              std::string fmHost, int fmPort,
+              std::string boardHost, int boardPort,
+              std::string selfHost, int selfPort)
+    : panelHost_(std::move(panelHost)),
+      panelPort_(panelPort),
+      fmHost_(std::move(fmHost)),
+      fmPort_(fmPort),
+      boardHost_(std::move(boardHost)),
+      boardPort_(boardPort),
+      selfHost_(std::move(selfHost)),
+      selfPort_(selfPort)
     {
     }
 
@@ -1277,8 +1296,8 @@ private:
     bool spawn_board_airborne_ack_(const std::string& flightId) {
         auto r = app::http_post_json(boardHost_, boardPort_, "/v1/planes/airborne", {
             {"flightId", flightId},
-            {"gcHost", "localhost"},
-            {"gcPort", 8081},
+            {"gcHost", selfHost_},
+            {"gcPort", selfPort_},
             {"pollSec", 5},
             {"touchdownDelaySec", 2}
         });
@@ -1289,8 +1308,8 @@ private:
         auto r = app::http_post_json(boardHost_, boardPort_, "/v1/planes/grounded", {
             {"flightId", flightId},
             {"parkingNode", parkingNode},
-            {"gcHost", "localhost"},
-            {"gcPort", 8081},
+            {"gcHost", selfHost_},
+            {"gcPort", selfPort_},
             {"pollSec", 3},
             {"handlingSec", 10},
             {"takeoffDelaySec", 2}
@@ -1663,6 +1682,9 @@ private:
     std::string fmHost_;
     int fmPort_;
 
+    std::string selfHost_ = "localhost";
+    int selfPort_ = 8081;
+
     std::string boardHost_ = "localhost";
     int boardPort_ = 8084;
 
@@ -1689,19 +1711,34 @@ private:
 
 int main(int argc, char** argv)
 {
-    int port = 8081;
-    std::string mapPath = "/home/user/dir/programming/C++/Yaroslava/Airport/data/airport_map.json";
+    // На каком порту слушает сам GroundControl
+    int port = env_or_int("GC_PORT", 8081);
+    if (argc > 1) {
+        port = std::stoi(argv[1]);
+    }
 
-    std::string panelHost = "localhost";
-    int panelPort = 8082;
+    // Путь к карте (в Docker обычно будет что-то вроде /app/data/airport_map.json)
+    std::string mapPath = env_or("GC_MAP_PATH", "./data/airport_map.json");
 
-    std::string fmHost = "localhost";
-    int fmPort = 8083;
+    // InformationPanel
+    std::string panelHost = env_or("INFO_HOST", "localhost");
+    int panelPort = env_or_int("INFO_PORT", 8082);
 
-    std::string boardHost = "localhost";
-    int boardPort = 8084;
+    // FollowMe
+    std::string fmHost = env_or("FOLLOWME_HOST", "localhost");
+    int fmPort = env_or_int("FOLLOWME_PORT", 8083);
 
-    GroundControl gc(panelHost, panelPort, fmHost, fmPort, boardHost, boardPort);
+    // Board
+    std::string boardHost = env_or("BOARD_HOST", "localhost");
+    int boardPort = env_or_int("BOARD_PORT", 8084);
+
+    // Как Board должен обращаться обратно к GroundControl
+    // В Docker это должно быть "ground-control"
+    std::string selfHost = env_or("GC_ADVERTISED_HOST", "localhost");
+    int selfPort = env_or_int("GC_ADVERTISED_PORT", port);
+
+    GroundControl gc(panelHost, panelPort, fmHost, fmPort, boardHost, boardPort, selfHost, selfPort);
+
     if (!gc.load_map(mapPath))
     {
         return 1;

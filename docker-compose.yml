@@ -1,9 +1,17 @@
-version: '3.9'
+#version: '3.9'
+
+x-airport-service: &airport-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  networks:
+    - airport-net
 
 services:
   postgres:
     image: postgres:16
-    container_name: followme-postgres
+    container_name: airport-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: airport
@@ -19,6 +27,109 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - airport-net
+
+  information-panel:
+    <<: *airport-service
+    container_name: information-panel
+    command: ['/app/build/InformationPanel', '8082']
+    ports:
+      - '8082:8082'
+    environment:
+      FM_PG_HOST: postgres
+      FM_PG_PORT: '5432'
+      FM_PG_DB: airport
+      FM_PG_USER: airport_user
+      FM_PG_PASSWORD: airport_pass
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8082/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  followme:
+    <<: *airport-service
+    container_name: followme
+    command: ['/app/build/FollowMe', '8083']
+    ports:
+      - '8083:8083'
+    environment:
+      GC_HOST: ground-control
+      GC_PORT: '8081'
+      FM_PG_HOST: postgres
+      FM_PG_PORT: '5432'
+      FM_PG_DB: airport
+      FM_PG_USER: airport_user
+      FM_PG_PASSWORD: airport_pass
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8083/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ground-control:
+    <<: *airport-service
+    container_name: ground-control
+    command: ['/app/build/GroundControl', '8081']
+    ports:
+      - '8081:8081'
+    environment:
+      GC_PORT: "8081"
+      GC_MAP_PATH: /app/data/airport_map.json
+      INFO_HOST: information-panel
+      INFO_PORT: "8082"
+      FOLLOWME_HOST: followme
+      FOLLOWME_PORT: "8083"
+      BOARD_HOST: board
+      BOARD_PORT: "8084"
+      GC_ADVERTISED_HOST: ground-control
+      GC_ADVERTISED_PORT: "8081"
+    depends_on:
+      information-panel:
+        condition: service_healthy
+      followme:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8081/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ./data:/app/data:ro
+
+  board:
+    <<: *airport-service
+    container_name: board
+    command: ['/app/build/Board', '8084']
+    ports:
+      - '8084:8084'
+    environment:
+      GC_HOST: ground-control
+      GC_PORT: '8081'
+      INFO_HOST: information-panel
+      INFO_PORT: '8082'
+      BOARD_PORT: '8084'
+    depends_on:
+      ground-control:
+        condition: service_healthy
+      information-panel:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8084/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:
+
+networks:
+  airport-net:
+    driver: bridge

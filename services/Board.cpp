@@ -1,9 +1,10 @@
 #include <atomic>
 #include <chrono>
-#include <cctype>      // <-- isalnum
+#include <cctype>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
-#include <memory>      // <-- unique_ptr, make_unique
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -13,6 +14,21 @@
 #include "common.h"
 
 using app::json;
+
+static std::string env_or(const char* key, const std::string& defVal) {
+    const char* v = std::getenv(key);
+    return (v && *v) ? std::string(v) : defVal;
+}
+
+static int env_or_int(const char* key, int defVal) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return defVal;
+    try {
+        return std::stoi(v);
+    } catch (...) {
+        return defVal;
+    }
+}
 
 namespace {
 
@@ -46,11 +62,29 @@ struct Agent {
     int handlingSec = 15;        // for grounded
     std::string parkingNode;     // for grounded
 
+    // handling supervisor (optional stub)
+    std::string handlingHost = "localhost";
+    int handlingPort = 8085;
+
     std::string lastError;
 };
 
 class BoardService {
 public:
+    BoardService() {
+        defaults_.gcHost = env_or("GC_HOST", "localhost");
+        defaults_.gcPort = env_or_int("GC_PORT", 8081);
+
+        defaults_.handlingHost = env_or("HANDLING_HOST", "localhost");
+        defaults_.handlingPort = env_or_int("HANDLING_PORT", 8085);
+
+        defaults_.airbornePollSec = env_or_int("BOARD_AIRBORNE_POLL_SEC", 30);
+        defaults_.groundedPollSec = env_or_int("BOARD_GROUNDED_POLL_SEC", 10);
+        defaults_.touchdownDelaySec = env_or_int("BOARD_TOUCHDOWN_DELAY_SEC", 2);
+        defaults_.takeoffDelaySec = env_or_int("BOARD_TAKEOFF_DELAY_SEC", 2);
+        defaults_.handlingSec = env_or_int("BOARD_HANDLING_SEC", 15);
+    }
+
     void run(int port) {
         httplib::Server svr;
 
@@ -63,7 +97,7 @@ public:
         });
 
         // Create airborne plane agent
-        // body: { "flightId":"SU100", "gcHost":"localhost", "gcPort":8081, "pollSec":30, "touchdownDelaySec":2 }
+        // body: { "flightId":"SU100", "gcHost":"ground-control", "gcPort":8081, "pollSec":30, "touchdownDelaySec":2 }
         svr.Post("/v1/planes/airborne", [&](const httplib::Request& req, httplib::Response& res) {
             auto bodyOpt = app::parse_json_body(req);
             if (!bodyOpt) {
@@ -83,10 +117,12 @@ public:
             a->kind = "airborne";
             a->state = "created";
             a->startedAt = app::now_sec();
-            a->gcHost = body.value("gcHost", std::string("localhost"));
-            a->gcPort = body.value("gcPort", 8081);
-            a->pollSec = body.value("pollSec", 30);
-            a->actionDelaySec = body.value("touchdownDelaySec", 2);
+
+            // По умолчанию — из env; можно переопределить в запросе
+            a->gcHost = body.value("gcHost", defaults_.gcHost);
+            a->gcPort = body.value("gcPort", defaults_.gcPort);
+            a->pollSec = body.value("pollSec", defaults_.airbornePollSec);
+            a->actionDelaySec = body.value("touchdownDelaySec", defaults_.touchdownDelaySec);
 
             const bool ok = start_or_replace_agent(std::move(a));
             app::reply_json(res, ok ? 200 : 500, {
@@ -97,8 +133,17 @@ public:
         });
 
         // Create grounded plane agent
-        // body: { "flightId":"SU100", "parkingNode":"P-5", "gcHost":"localhost", "gcPort":8081,
-        //         "pollSec":10, "handlingSec":15, "takeoffDelaySec":2 }
+        // body: {
+        //   "flightId":"SU100",
+        //   "parkingNode":"P-5",
+        //   "gcHost":"ground-control",
+        //   "gcPort":8081,
+        //   "pollSec":10,
+        //   "handlingSec":15,
+        //   "takeoffDelaySec":2,
+        //   "handlingHost":"handling-supervisor",   // optional
+        //   "handlingPort":8085                     // optional
+        // }
         svr.Post("/v1/planes/grounded", [&](const httplib::Request& req, httplib::Response& res) {
             auto bodyOpt = app::parse_json_body(req);
             if (!bodyOpt) {
@@ -120,12 +165,16 @@ public:
             a->kind = "grounded";
             a->state = "created";
             a->startedAt = app::now_sec();
-            a->gcHost = body.value("gcHost", std::string("localhost"));
-            a->gcPort = body.value("gcPort", 8081);
-            a->pollSec = body.value("pollSec", 10);
-            a->handlingSec = body.value("handlingSec", 15);
-            a->actionDelaySec = body.value("takeoffDelaySec", 2);
+
+            a->gcHost = body.value("gcHost", defaults_.gcHost);
+            a->gcPort = body.value("gcPort", defaults_.gcPort);
+            a->pollSec = body.value("pollSec", defaults_.groundedPollSec);
+            a->handlingSec = body.value("handlingSec", defaults_.handlingSec);
+            a->actionDelaySec = body.value("takeoffDelaySec", defaults_.takeoffDelaySec);
             a->parkingNode = parkingNode;
+
+            a->handlingHost = body.value("handlingHost", defaults_.handlingHost);
+            a->handlingPort = body.value("handlingPort", defaults_.handlingPort);
 
             const bool ok = start_or_replace_agent(std::move(a));
             app::reply_json(res, ok ? 200 : 500, {
@@ -140,6 +189,7 @@ public:
             json arr = json::array();
             std::lock_guard<std::mutex> lk(mtx_);
             for (const auto& [id, a] : agents_) {
+                (void)id;
                 arr.push_back({
                     {"flightId", a->flightId},
                     {"kind", a->kind},
@@ -147,6 +197,8 @@ public:
                     {"parkingNode", a->parkingNode},
                     {"gcHost", a->gcHost},
                     {"gcPort", a->gcPort},
+                    {"handlingHost", a->handlingHost},
+                    {"handlingPort", a->handlingPort},
                     {"pollSec", a->pollSec},
                     {"startedAt", a->startedAt},
                     {"lastError", a->lastError}
@@ -173,18 +225,34 @@ public:
         });
 
         std::cout << "[Board] listening on 0.0.0.0:" << port << "\n";
+        std::cout << "[Board] defaults: GC=" << defaults_.gcHost << ":" << defaults_.gcPort
+                  << ", Handling=" << defaults_.handlingHost << ":" << defaults_.handlingPort << "\n";
+
         svr.listen("0.0.0.0", port);
 
         stop_all();
     }
 
 private:
+    struct Defaults {
+        std::string gcHost;
+        int gcPort = 8081;
+
+        std::string handlingHost;
+        int handlingPort = 8085;
+
+        int airbornePollSec = 30;
+        int groundedPollSec = 10;
+        int touchdownDelaySec = 2;
+        int takeoffDelaySec = 2;
+        int handlingSec = 15;
+    };
+
     bool start_or_replace_agent(std::unique_ptr<Agent> ptr) {
         if (!ptr || ptr->flightId.empty()) return false;
 
         const std::string flightId = ptr->flightId;
 
-        // stop existing
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = agents_.find(flightId);
@@ -194,14 +262,12 @@ private:
         }
         join_and_erase(flightId);
 
-        // insert new
         Agent* ap = ptr.get();
         {
             std::lock_guard<std::mutex> lk(mtx_);
             agents_[flightId] = std::move(ptr);
         }
 
-        // start thread (agent object already owned by map)
         ap->th = std::thread([this, ap]() {
             if (ap->kind == "airborne") {
                 run_airborne(*ap);
@@ -245,6 +311,7 @@ private:
             }
 
             a.state = "airborne.landed_notified";
+            a.lastError.clear();
             return;
         }
 
@@ -255,7 +322,7 @@ private:
         a.state = "grounded.request_handling_stub";
 
         // HandlingSupervisor stub (если сервиса нет — это не ошибка)
-        (void)app::http_post_json("localhost", 8085, "/v1/handling/request", {
+        (void)app::http_post_json(a.handlingHost, a.handlingPort, "/v1/handling/request", {
             {"flightId", a.flightId},
             {"parkingNode", a.parkingNode},
             {"services", json::array({"fuel", "catering", "boarding"})}
@@ -289,37 +356,14 @@ private:
                 continue;
             }
 
-            // разрешили взлет — ПОКА НИЧЕГО НЕ ДЕЛАЕМ (как ты попросила)
             a.state = "grounded.takeoff_approved_noop";
             a.lastError.clear();
 
-            // просто остаёмся живыми до stop (или можешь return, если хочешь авто-завершение)
             while (!a.stop.load()) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
             a.state = "stopped";
             return;
-
-            // const bool allowed = r.body.value("allowed", false);
-            // if (!allowed) {
-            //     a.state = std::string("grounded.takeoff_denied:") + r.body.value("reason", "");
-            //     std::this_thread::sleep_for(std::chrono::seconds(a.pollSec));
-            //     continue;
-            // }
-            //
-            // a.state = "grounded.takeoff_approved";
-            // std::this_thread::sleep_for(std::chrono::seconds(a.actionDelaySec));
-            //
-            // const std::string tookoffPath = "/v1/flights/" + url_encode(a.flightId) + "/tookoff";
-            // auto rr = app::http_post_json(a.gcHost, a.gcPort, tookoffPath, json::object());
-            // if (!rr.ok()) {
-            //     a.lastError = "failed to POST tookoff";
-            //     std::this_thread::sleep_for(std::chrono::seconds(2));
-            //     continue;
-            // }
-            //
-            // a.state = "grounded.tookoff_notified";
-            // return;
         }
 
         a.state = "stopped";
@@ -344,7 +388,7 @@ private:
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = agents_.find(flightId);
             if (it == agents_.end()) return;
-            victim = std::move(it->second); // забираем владение
+            victim = std::move(it->second);
             agents_.erase(it);
         }
 
@@ -358,16 +402,19 @@ private:
         {
             std::lock_guard<std::mutex> lk(mtx_);
             for (auto& [id, a] : agents_) {
+                (void)id;
                 a->stop.store(true);
             }
             tmp = std::move(agents_);
         }
         for (auto& [id, a] : tmp) {
+            (void)id;
             if (a->th.joinable()) a->th.join();
         }
     }
 
 private:
+    Defaults defaults_;
     std::mutex mtx_;
     std::unordered_map<std::string, std::unique_ptr<Agent>> agents_;
 };
@@ -375,7 +422,7 @@ private:
 } // namespace
 
 int main(int argc, char** argv) {
-    int port = 8084;
+    int port = env_or_int("BOARD_PORT", 8084);
     if (argc > 1) port = std::stoi(argv[1]);
 
     BoardService s;
