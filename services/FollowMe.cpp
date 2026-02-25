@@ -19,6 +19,7 @@ struct Vehicle {
     std::string status = "empty"; // empty, reserved, moveToLandingPosition, movingWithPlane, returning
     std::string currentNode = "FS-1";
     std::string flightId;
+    std::string missionType; // "", "landing", "takeoff"
 };
 
 class VehicleRepository {
@@ -233,6 +234,12 @@ public:
                 return;
             }
 
+            const std::string missionType = body.value("missionType", std::string("landing"));
+            if (missionType != "landing" && missionType != "takeoff") {
+                app::reply_json(res, 400, {{"error", "invalid missionType"}});
+                return;
+            }
+
             std::string picked;
             try {
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -240,6 +247,7 @@ public:
                     if (v.status == "empty") {
                         v.status = "reserved";
                         v.flightId = flightId;
+                        v.missionType = missionType;
                         repo_.upsert_one(v); // persist
                         picked = id;
                         break;
@@ -261,8 +269,8 @@ public:
             }
 
             // start background mission worker
-            std::thread([this, picked, flightId]() {
-                this->run_mission_worker(picked, flightId);
+            std::thread([this, picked, flightId, missionType]() {
+                this->run_mission_worker(picked, flightId, missionType);
             }).detach();
 
             app::reply_json(res, 200, {
@@ -407,16 +415,17 @@ private:
         return out;
     }
 
-    bool drive_route(const std::string& vehicleId, const std::string& flightId, const std::vector<std::string>& routeNodes) {
-        if (routeNodes.size() < 2) {
-            return true;
-        }
+    bool drive_route(const std::string& vehicleId,
+                const std::string& flightId,
+                const std::vector<std::string>& routeNodes,
+                int maxWaitPerStepSec = 90) {
+        if (routeNodes.size() < 2) return true;
 
         for (size_t i = 0; i + 1 < routeNodes.size(); ++i) {
             const std::string from = routeNodes[i];
             const std::string to = routeNodes[i + 1];
 
-            // Wait until allowed to enter edge
+            int waited = 0;
             while (true) {
                 auto enterRes = app::http_post_json(gcHost_, gcPort_, "/v1/map/traffic/enter-edge", {
                     {"vehicleId", vehicleId},
@@ -430,12 +439,16 @@ private:
                 }
 
                 std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (++waited >= maxWaitPerStepSec) {
+                    std::cerr << "[FollowMe] enter-edge timeout " << from << " -> " << to << "\n";
+                    return false;
+                }
             }
 
-            // simulate travel on edge
+            // движение по ребру
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            // Wait until allowed to leave edge to target node
+            waited = 0;
             while (true) {
                 auto leaveRes = app::http_post_json(gcHost_, gcPort_, "/v1/map/traffic/leave-edge", {
                     {"vehicleId", vehicleId},
@@ -449,83 +462,124 @@ private:
                 }
 
                 std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (++waited >= maxWaitPerStepSec) {
+                    std::cerr << "[FollowMe] leave-edge timeout -> " << to << "\n";
+                    return false;
+                }
             }
         }
 
         return true;
     }
 
-    void run_mission_worker(const std::string& vehicleId, const std::string& flightId) {
-        // 1) Get mission path
-        auto missionRes = app::http_get_json(gcHost_, gcPort_, "/v1/map/followme/path?flightId=" + flightId);
+    void run_mission_worker(const std::string& vehicleId,
+                            const std::string& flightId,
+                            const std::string& missionType) {
+        // 1) Получить маршрут у GroundControl
+        auto missionRes = app::http_get_json(
+            gcHost_, gcPort_,
+            "/v1/map/followme/path?flightId=" + flightId + "&missionType=" + missionType
+        );
+
         if (!missionRes.ok()) {
-            // release vehicle
-            try {
-                std::lock_guard<std::mutex> lk(mtx_);
-                auto it = vehicles_.find(vehicleId);
-                if (it != vehicles_.end()) {
-                    it->second.status = "empty";
-                    it->second.flightId.clear();
-                    repo_.upsert_one(it->second);
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "[FollowMe][DB] worker rollback failed: " << e.what() << '\n';
-            }
+            rollback_vehicle_to_empty(vehicleId);
             return;
         }
 
-        auto routeToRunway = json_to_nodes(missionRes.body, "routeToRunway");
+        // Для совместимости:
+        std::vector<std::string> routeA;
+        if (missionType == "landing") {
+            routeA = json_to_nodes(missionRes.body, "routeToRunway");
+        } else {
+            routeA = json_to_nodes(missionRes.body, "routeToPlane");
+        }
+
         auto routeWithPlane = json_to_nodes(missionRes.body, "routeWithPlane");
         auto routeReturn = json_to_nodes(missionRes.body, "routeReturn");
 
-        // 2) poll start permission every 5 sec
+        // 2) Ждем разрешение стартовать миссию
         while (true) {
-            auto permRes = app::http_get_json(gcHost_, gcPort_, "/v1/map/followme/permission?flightId=" + flightId);
+            auto permRes = app::http_get_json(
+                gcHost_, gcPort_,
+                "/v1/map/followme/permission?flightId=" + flightId + "&missionType=" + missionType
+            );
             if (permRes.ok() && permRes.body.value("allowed", false)) {
                 break;
             }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
 
-        // 3) move to RE-1
-        set_vehicle_status(vehicleId, "moveToLandingPosition");
-        if (!drive_route(vehicleId, flightId, routeToRunway)) {
+        // 3) Движение машинки к точке встречи
+        set_vehicle_status(vehicleId, missionType == "landing" ? "moveToLandingPosition" : "moveToPlane");
+        if (!drive_route(vehicleId, flightId, routeA)) {
+            notify_mission_failed(vehicleId, flightId, missionType, "routeA_timeout");
+            rollback_vehicle_to_empty(vehicleId);
             return;
         }
 
-        // 4) move with plane to parking
+        // 4) Ведем самолет
         set_vehicle_status(vehicleId, "movingWithPlane");
         if (!drive_route(vehicleId, flightId, routeWithPlane)) {
+            notify_mission_failed(vehicleId, flightId, missionType, "routeWithPlane_timeout");
+            rollback_vehicle_to_empty(vehicleId);
             return;
         }
 
-        // 5) inform GroundControl parking reached
-        (void)app::http_post_json(gcHost_, gcPort_, "/v1/vehicles/followme", {
-            {"vehicleId", vehicleId},
-            {"flightId", flightId},
-            {"status", "arrivedParking"}
-        });
+        // 5) Уведомляем GC о ключевой точке
+        if (missionType == "landing") {
+            (void)app::http_post_json(gcHost_, gcPort_, "/v1/vehicles/followme", {
+                {"vehicleId", vehicleId},
+                {"flightId", flightId},
+                {"missionType", missionType},
+                {"status", "arrivedParking"}
+            });
+        } else {
+            (void)app::http_post_json(gcHost_, gcPort_, "/v1/vehicles/followme", {
+                {"vehicleId", vehicleId},
+                {"flightId", flightId},
+                {"missionType", missionType},
+                {"status", "arrivedRunwayEntrance"}
+            });
+        }
 
-        // 6) return to FS-1
+        // 6) Возвращаемся на базу
         set_vehicle_status(vehicleId, "returning");
         (void)drive_route(vehicleId, flightId, routeReturn);
 
-        // 7) done => empty
+        // 7) Освобождаем машинку
+        rollback_vehicle_to_empty(vehicleId);
+
+        (void)app::http_post_json(gcHost_, gcPort_, "/v1/followme/mission/completed", {
+            {"vehicleId", vehicleId},
+            {"flightId", flightId},
+            {"missionType", missionType}
+        });
+    }
+
+    void rollback_vehicle_to_empty(const std::string& vehicleId) {
         try {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = vehicles_.find(vehicleId);
             if (it != vehicles_.end()) {
                 it->second.status = "empty";
                 it->second.flightId.clear();
+                it->second.missionType.clear();
                 repo_.upsert_one(it->second);
             }
         } catch (const std::exception& e) {
-            std::cerr << "[FollowMe][DB] final persist failed: " << e.what() << '\n';
+            std::cerr << "[FollowMe][DB] rollback failed: " << e.what() << '\n';
         }
+    }
 
-        (void)app::http_post_json(gcHost_, gcPort_, "/v1/followme/mission/completed", {
+    void notify_mission_failed(const std::string& vehicleId,
+                              const std::string& flightId,
+                              const std::string& missionType,
+                              const std::string& reason) {
+        (void)app::http_post_json(gcHost_, gcPort_, "/v1/followme/mission/failed", {
             {"vehicleId", vehicleId},
-            {"flightId", flightId}
+            {"flightId", flightId},
+            {"missionType", missionType},
+            {"reason", reason}
         });
     }
 

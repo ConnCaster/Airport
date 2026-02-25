@@ -27,11 +27,21 @@ static bool is_terminal_status(const std::string& s) {
 }
 
 static bool is_ground_status(const std::string& s) {
-    return s == "ArrivedParking" || s == "Parked" || s == "OnStand";
+    return s == "ArrivedParking" ||
+           s == "Parked" ||
+           s == "OnStand" ||
+           s == "HandlingDone" ||
+           s == "TaxiOutRequested" ||
+           s == "ReadyForTakeoff" ||
+           s == "TakeoffApproved";
 }
 
 static bool is_air_status(const std::string& s) {
-    return s == "Scheduled" || s == "Delayed" || s == "LandingApproved" || s == "Airborne" || s == "LandedAtRE1";
+    return s == "Scheduled" ||
+           s == "Delayed" ||
+           s == "LandingApproved" ||
+           s == "Airborne" ||
+           s == "LandedAtRE1";
 }
 
 static std::string infer_phase(const std::string& status, const std::string& explicitPhase) {

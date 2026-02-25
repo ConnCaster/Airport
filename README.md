@@ -15,6 +15,9 @@ POST /v1/flights/{flightId}/landed
 POST /v1/flights/{flightId}/tookoff
     Информирование о фактическом взлете (Board -> GroundControl) 
       
+GET /v1/takeoff_permission
+   ----
+      
 POST /v1/vehicles/init
     Информирование о всех созданных машинках FollowMe, чтобы отрисовать их на карте (FollowMe -> GroundControl)
      
@@ -102,6 +105,9 @@ POST /v1/planes/stop
 
 * GET /v1/planes (не используется)
     Получение списка активных агентов самолетов и их состояния (диагностика) (* -> Board)
+
+POST /v1/planes/handling-complete
+   ---
 
 GET /health
     Проверка, что сервис запустился

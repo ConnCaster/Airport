@@ -47,6 +47,11 @@ struct FlightSession
 
     bool landingApproved = false;
     bool landed = false;
+    bool takeoffTaxiRequested = false;   // запросили FollowMe для выруливания
+    bool atRunwayEntrance = false;       // самолет доставлен в RE-1
+    bool takeoffApproved = false;        // GroundControl дал разрешение на взлет
+    bool tookoff = false;                // взлет подтвержден
+
     std::string status = "Created";
     int64_t createdAt = 0;
 };
@@ -294,8 +299,9 @@ public:
             }
 
             auto reserveRes = app::http_post_json(fmHost_, fmPort_, "/v1/vehicles/reserve", {
-                                                      {"flightId", flightId}
-                                                  });
+                {"flightId", flightId},
+                {"missionType", "landing"}
+            });
             if (!reserveRes.ok())
             {
                 notify_panel_status(flightId, "Delayed", "followme_reservation_failed");
@@ -375,6 +381,156 @@ public:
                             });
         });
 
+        svr.Post(R"(/v1/flights/([A-Za-z0-9\-_]+)/prepare_takeoff)", [&](const httplib::Request& req, httplib::Response& res)
+        {
+            const std::string flightId = req.matches[1];
+
+            // 1) Проверяем в InformationPanel, что самолет на земле и вылет разрешаем по расписанию
+            auto panelRes = app::http_get_json(
+                panelHost_, panelPort_,
+                "/v1/flights/" + flightId + "?ts=" + std::to_string(app::now_sec())
+            );
+
+            if (!panelRes.ok()) {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "panel_unreachable"}
+                });
+                return;
+            }
+
+            const std::string phase = panelRes.body.value("phase", std::string("grounded"));
+            if (phase != "grounded") {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "not_grounded"},
+                    {"phase", phase}
+                });
+                return;
+            }
+
+            if (panelRes.body.contains("takeoffAllowed") && panelRes.body["takeoffAllowed"].is_boolean()) {
+                if (!panelRes.body["takeoffAllowed"].get<bool>()) {
+                    app::reply_json(res, 200, {
+                        {"ok", false},
+                        {"flightId", flightId},
+                        {"retryAfterSec", 10},
+                        {"reason", "panel_denied_takeoff"}
+                    });
+                    return;
+                }
+            }
+
+            std::string parkingNode = panelRes.body.value("parkingNode", std::string());
+
+            // 2) Идемпотентность + fallback на карту, если panel не дал parkingNode
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+
+                auto it = sessions_.find(flightId);
+                if (it != sessions_.end() && it->second.takeoffTaxiRequested) {
+                    app::reply_json(res, 200, {
+                        {"ok", true},
+                        {"flightId", flightId},
+                        {"reason", "already_requested"},
+                        {"vehicleId", it->second.vehicleId},
+                        {"parkingNode", it->second.parkingNode}
+                    });
+                    return;
+                }
+
+                if (parkingNode.empty()) {
+                    auto pn = find_plane_node_unsafe(flightId);
+                    if (pn) parkingNode = *pn;
+                }
+            }
+
+            if (parkingNode.empty()) {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "parking_node_unknown"}
+                });
+                return;
+            }
+
+            // 3) FollowMe резервируем на миссию takeoff
+            auto hasEmpty = app::http_get_json(fmHost_, fmPort_, "/v1/vehicles/hasEmpty");
+            if (!hasEmpty.ok() || !hasEmpty.body.value("hasEmpty", false)) {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "no_followme_available"}
+                });
+                return;
+            }
+
+            auto reserveRes = app::http_post_json(fmHost_, fmPort_, "/v1/vehicles/reserve", {
+                {"flightId", flightId},
+                {"missionType", "takeoff"}
+            });
+
+            if (!reserveRes.ok()) {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "followme_reservation_failed"}
+                });
+                return;
+            }
+
+            const std::string vehicleId = reserveRes.body.value("vehicleId", "");
+            if (vehicleId.empty()) {
+                app::reply_json(res, 200, {
+                    {"ok", false},
+                    {"flightId", flightId},
+                    {"retryAfterSec", 10},
+                    {"reason", "followme_vehicle_empty"}
+                });
+                return;
+            }
+
+            // 4) Фиксируем takeoff-сессию
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+
+                auto& s = sessions_[flightId];
+                if (s.createdAt == 0) s.createdAt = app::now_sec();
+
+                s.flightId = flightId;
+                s.vehicleId = vehicleId;
+                s.parkingNode = parkingNode;
+
+                s.takeoffTaxiRequested = true;
+                s.atRunwayEntrance = false;
+                s.takeoffApproved = false;
+                s.tookoff = false;
+                s.status = "TaxiOutRequested";
+
+                push_event_unsafe("flight.prepare_takeoff", {
+                    {"flightId", flightId},
+                    {"vehicleId", vehicleId},
+                    {"parkingNode", parkingNode}
+                });
+            }
+
+            notify_panel_status(flightId, "TaxiOutRequested", "followme_reserved_for_takeoff", parkingNode);
+
+            app::reply_json(res, 200, {
+                {"ok", true},
+                {"flightId", flightId},
+                {"vehicleId", vehicleId},
+                {"parkingNode", parkingNode}
+            });
+        });
+
         svr.Get("/v1/takeoff_permission", [&](const httplib::Request& req, httplib::Response& res)
         {
             if (!req.has_param("flightId"))
@@ -384,7 +540,7 @@ public:
             }
             const std::string flightId = req.get_param_value("flightId");
 
-            // 1) спрашиваем панель (если у неё нет специального поля — просто не блокируем)
+            // 1) Проверка панели
             auto panelRes = app::http_get_json(
                 panelHost_, panelPort_,
                 "/v1/flights/" + flightId + "?ts=" + std::to_string(app::now_sec())
@@ -417,67 +573,83 @@ public:
                 }
             }
 
-            std::string planeNode;
-
             {
                 std::lock_guard<std::mutex> lk(mtx_);
 
-                // 2) самолет должен быть на земле (на парковке P-*)
+                auto it = sessions_.find(flightId);
+                if (it == sessions_.end() || !it->second.takeoffTaxiRequested) {
+                    app::reply_json(res, 200, {
+                        {"flightId", flightId},
+                        {"allowed", false},
+                        {"retryAfterSec", 10},
+                        {"reason", "taxi_not_started"}
+                    });
+                    return;
+                }
+
+                if (!it->second.atRunwayEntrance) {
+                    app::reply_json(res, 200, {
+                        {"flightId", flightId},
+                        {"allowed", false},
+                        {"retryAfterSec", 5},
+                        {"reason", "not_at_runway_entrance"}
+                    });
+                    return;
+                }
+
+                // Самолет должен реально стоять в RE-1
                 auto pn = find_plane_node_unsafe(flightId);
-                if (!pn)
-                {
+                if (!pn || *pn != kLandingNode) {
                     app::reply_json(res, 200, {
-                                        {"flightId", flightId},
-                                        {"allowed", false},
-                                        {"retryAfterSec", 10},
-                                        {"reason", "plane_not_on_ground"}
-                                    });
-                    return;
-                }
-                planeNode = *pn;
-
-                // 3) RW-1 должен быть свободен для взлета (мы будем резервировать его)
-                // idempotent: если уже зарезервировали под этот flight
-                if (nodeOcc_[kTakeoffNode].count("takeoff_reservation:" + flightId) > 0)
-                {
-                    app::reply_json(res, 200, {
-                                        {"flightId", flightId},
-                                        {"allowed", true},
-                                        {"reason", "already_reserved"},
-                                        {"from", planeNode},
-                                        {"runwayEntrance", kTakeoffNode}
-                                    });
+                        {"flightId", flightId},
+                        {"allowed", false},
+                        {"retryAfterSec", 5},
+                        {"reason", "plane_not_at_re1"}
+                    });
                     return;
                 }
 
-                if (!node_has_slot_unsafe(kTakeoffNode))
-                {
+                // Идемпотентность: уже одобряли
+                if (nodeOcc_[kTakeoffNode].count("takeoff_reservation:" + flightId) > 0) {
                     app::reply_json(res, 200, {
-                                        {"flightId", flightId},
-                                        {"allowed", false},
-                                        {"retryAfterSec", 10},
-                                        {"reason", "re1_busy"}
-                                    });
+                        {"flightId", flightId},
+                        {"allowed", true},
+                        {"reason", "already_reserved"},
+                        {"from", kLandingNode},
+                        {"runwayNode", kTakeoffNode}
+                    });
                     return;
                 }
 
-                // резервируем RW-1 на время “выруливания/взлета”
+                // RW-1 должен быть свободен
+                if (!node_has_slot_unsafe(kTakeoffNode)) {
+                    app::reply_json(res, 200, {
+                        {"flightId", flightId},
+                        {"allowed", false},
+                        {"retryAfterSec", 5},
+                        {"reason", "rw1_busy"}
+                    });
+                    return;
+                }
+
                 nodeOcc_[kTakeoffNode].insert("takeoff_reservation:" + flightId);
+                it->second.takeoffApproved = true;
+                it->second.status = "TakeoffApproved";
 
                 push_event_unsafe("flight.takeoff_approved", {
-                                      {"flightId", flightId},
-                                      {"from", planeNode},
-                                      {"runwayEntrance", kTakeoffNode}
-                                  });
+                    {"flightId", flightId},
+                    {"from", kLandingNode},
+                    {"runwayNode", kTakeoffNode}
+                });
             }
 
             notify_panel_status(flightId, "TakeoffApproved", "rw1_reserved_for_takeoff");
             app::reply_json(res, 200, {
-                                {"flightId", flightId},
-                                {"allowed", true},
-                                {"from", planeNode},
-                                {"runwayEntrance", kTakeoffNode}
-                            });
+                {"flightId", flightId},
+                {"allowed", true},
+                {"from", kLandingNode},
+                {"runwayNode", kTakeoffNode}
+            });
         });
 
 
@@ -518,7 +690,6 @@ public:
         svr.Post(R"(/v1/flights/([A-Za-z0-9\-_]+)/tookoff)", [&](const httplib::Request& req, httplib::Response& res) {
             const std::string flightId = req.matches[1];
 
-            std::string fromNode;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
 
@@ -527,15 +698,39 @@ public:
                     app::reply_json(res, 404, {{"error", "plane_not_found_on_ground"}});
                     return;
                 }
-                fromNode = *pn;
 
-                nodeOcc_[fromNode].erase("plane:" + flightId);
-                reservedParking_.erase(fromNode);
+                if (*pn != kLandingNode) {
+                    app::reply_json(res, 409, {
+                        {"error", "plane_not_at_re1"},
+                        {"currentNode", *pn}
+                    });
+                    return;
+                }
+
+                if (nodeOcc_[kTakeoffNode].count("takeoff_reservation:" + flightId) == 0) {
+                    app::reply_json(res, 409, {{"error", "takeoff_not_approved"}});
+                    return;
+                }
+
+                // Убираем самолет с RE-1, освобождаем RW-1 reservation
+                nodeOcc_[kLandingNode].erase("plane:" + flightId);
                 nodeOcc_[kTakeoffNode].erase("takeoff_reservation:" + flightId);
+
+                auto it = sessions_.find(flightId);
+                if (it != sessions_.end()) {
+                    it->second.tookoff = true;
+                    it->second.takeoffApproved = false;
+                    it->second.atRunwayEntrance = false;
+                    it->second.takeoffTaxiRequested = false;
+                    it->second.status = "Departed";
+                    // parkingNode можно оставить как last-known, это не мешает
+                }
+
+                corridor_release_if_holder_unsafe_(flightId, "tookoff");
 
                 push_event_unsafe("flight.tookoff", {
                     {"flightId", flightId},
-                    {"from", fromNode}
+                    {"from", kLandingNode}
                 });
             }
 
@@ -544,7 +739,7 @@ public:
         });
 
         // followme asks mission path
-        auto mission_path_handler = [&](const std::string& flightId, httplib::Response& res)
+        auto mission_path_handler = [&](const std::string& flightId, const std::string& missionType, httplib::Response& res)
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = sessions_.find(flightId);
@@ -555,8 +750,13 @@ public:
             }
 
             const auto& s = it->second;
-            std::string vehicleNode = "FS-1";
+            if (s.vehicleId.empty())
+            {
+                app::reply_json(res, 409, {{"error", "vehicle_not_assigned"}});
+                return;
+            }
 
+            std::string vehicleNode = "FS-1";
             auto pIt = vehiclePos_.find(s.vehicleId);
             if (pIt != vehiclePos_.end())
             {
@@ -570,19 +770,46 @@ public:
                 }
             }
 
+            if (missionType == "takeoff")
+            {
+                if (s.parkingNode.empty())
+                {
+                    app::reply_json(res, 409, {{"error", "parking_node_unknown_for_takeoff"}});
+                    return;
+                }
+
+                auto routeToPlane = shortest_path_nodes_unsafe(vehicleNode, s.parkingNode, "carRoad");
+                auto routeWithPlane = shortest_path_nodes_unsafe(s.parkingNode, "RE-1", "planeRoad");
+                auto routeReturn = shortest_path_nodes_unsafe("RE-1", "FS-1", "carRoad");
+
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"missionType", "takeoff"},
+                    {"vehicleId", s.vehicleId},
+                    {"from", s.parkingNode},
+                    {"to", "RE-1"},
+                    {"routeToPlane", routeToPlane},
+                    {"routeWithPlane", routeWithPlane},
+                    {"routeReturn", routeReturn}
+                });
+                return;
+            }
+
+            // landing (default)
             auto routeToRunway = shortest_path_nodes_unsafe(vehicleNode, "RE-1", "carRoad");
             auto routeWithPlane = shortest_path_nodes_unsafe("RE-1", s.parkingNode, "planeRoad");
             auto routeReturn = shortest_path_nodes_unsafe(s.parkingNode, "FS-1", "carRoad");
 
             app::reply_json(res, 200, {
-                                {"flightId", flightId},
-                                {"vehicleId", s.vehicleId},
-                                {"from", "RE-1"},
-                                {"to", s.parkingNode},
-                                {"routeToRunway", routeToRunway},
-                                {"routeWithPlane", routeWithPlane},
-                                {"routeReturn", routeReturn}
-                            });
+                {"flightId", flightId},
+                {"missionType", "landing"},
+                {"vehicleId", s.vehicleId},
+                {"from", "RE-1"},
+                {"to", s.parkingNode},
+                {"routeToRunway", routeToRunway},
+                {"routeWithPlane", routeWithPlane},
+                {"routeReturn", routeReturn}
+            });
         };
 
         svr.Get("/v1/map/followme/path", [&](const httplib::Request& req, httplib::Response& res)
@@ -592,17 +819,26 @@ public:
                 app::reply_json(res, 400, {{"error", "flightId required"}});
                 return;
             }
-            mission_path_handler(req.get_param_value("flightId"), res);
+            const std::string missionType = req.has_param("missionType")
+                ? req.get_param_value("missionType")
+                : "landing";
+
+            if (missionType != "landing" && missionType != "takeoff") {
+                app::reply_json(res, 400, {{"error", "invalid missionType"}});
+                return;
+            }
+
+            mission_path_handler(req.get_param_value("flightId"), missionType, res);
         });
 
         // backward-compat from your draft:
         svr.Get(R"(/v1/map/followme/path/flightId=([A-Za-z0-9\-_]+))",
-                [&](const httplib::Request& req, httplib::Response& res)
-                {
-                    mission_path_handler(req.matches[1], res);
-                });
+            [&](const httplib::Request& req, httplib::Response& res)
+            {
+                mission_path_handler(req.matches[1], "landing", res);
+            });
 
-        auto permission_handler = [&](const std::string& flightId, httplib::Response& res)
+        auto permission_handler = [&](const std::string& flightId, const std::string& missionType, httplib::Response& res)
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = sessions_.find(flightId);
@@ -611,10 +847,44 @@ public:
                 app::reply_json(res, 404, {{"error", "session_not_found"}});
                 return;
             }
+
+            bool baseAllowed = false;
+            if (missionType == "landing") {
+                baseAllowed = it->second.landed; // самолет уже в RE-1
+            } else if (missionType == "takeoff") {
+                baseAllowed = it->second.takeoffTaxiRequested; // запрос на выруливание создан
+            } else {
+                app::reply_json(res, 400, {{"error", "invalid missionType"}});
+                return;
+            }
+
+            if (!baseAllowed) {
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"missionType", missionType},
+                    {"allowed", false}
+                });
+                return;
+            }
+
+            // Узкий коридор: одновременно только один convoy (landing/takeoff)
+            if (!corridor_try_acquire_unsafe_(flightId, missionType)) {
+                app::reply_json(res, 200, {
+                    {"flightId", flightId},
+                    {"missionType", missionType},
+                    {"allowed", false},
+                    {"reason", "corridor_busy"},
+                    {"holderFlightId", corridorHolderFlightId_},
+                    {"holderMissionType", corridorHolderMissionType_}
+                });
+                return;
+            }
+
             app::reply_json(res, 200, {
-                                {"flightId", flightId},
-                                {"allowed", it->second.landed}
-                            });
+                {"flightId", flightId},
+                {"missionType", missionType},
+                {"allowed", true}
+            });
         };
 
         svr.Get("/v1/map/followme/permission", [&](const httplib::Request& req, httplib::Response& res)
@@ -624,14 +894,19 @@ public:
                 app::reply_json(res, 400, {{"error", "flightId required"}});
                 return;
             }
-            permission_handler(req.get_param_value("flightId"), res);
+
+            const std::string missionType = req.has_param("missionType")
+                ? req.get_param_value("missionType")
+                : "landing";
+
+            permission_handler(req.get_param_value("flightId"), missionType, res);
         });
 
         svr.Get(R"(/v1/map/followme/permission/flightId=([A-Za-z0-9\-_]+))",
-                [&](const httplib::Request& req, httplib::Response& res)
-                {
-                    permission_handler(req.matches[1], res);
-                });
+            [&](const httplib::Request& req, httplib::Response& res)
+            {
+                permission_handler(req.matches[1], "landing", res);
+            });
 
         // FollowMe asks to enter edge (atomic check edge capacity + current position)
         svr.Post("/v1/map/traffic/enter-edge", [&](const httplib::Request& req, httplib::Response& res)
@@ -845,70 +1120,116 @@ public:
 
             const std::string flightId = app::s_or(body, "flightId");
             const std::string status = app::s_or(body, "status");
+            const std::string missionType = body.value("missionType", std::string("landing"));
+
             if (flightId.empty() || status.empty())
             {
                 app::reply_json(res, 400, {{"error", "flightId and status required"}});
                 return;
             }
 
-            if (status != "arrivedParking")
+            // --- LANDING: самолет доставлен на парковку ---
+            if (status == "arrivedParking")
             {
-                app::reply_json(res, 400, {{"error", "unsupported status"}});
-                return;
-            }
-
-            std::string parking;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                auto it = sessions_.find(flightId);
-                if (it == sessions_.end())
+                std::string parking;
                 {
-                    app::reply_json(res, 404, {{"error", "session_not_found"}});
-                    return;
-                }
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    auto it = sessions_.find(flightId);
+                    if (it == sessions_.end())
+                    {
+                        app::reply_json(res, 404, {{"error", "session_not_found"}});
+                        return;
+                    }
 
-                parking = it->second.parkingNode;
-                reservedParking_.erase(parking);
+                    parking = it->second.parkingNode;
+                    reservedParking_.erase(parking);
 
-                // sanity
-                if (!nodes_.count(parking)) {
-                    push_event_unsafe("flight.arrived_parking_error", {
+                    if (!nodes_.count(parking)) {
+                        push_event_unsafe("flight.arrived_parking_error", {
+                            {"flightId", flightId},
+                            {"parking", parking},
+                            {"reason", "unknown_parking_node"}
+                        });
+                        app::reply_json(res, 409, {{"error", "unknown parking node"}, {"parking", parking}});
+                        return;
+                    }
+
+                    if (!node_has_plane_slot_unsafe_(parking) && nodeOcc_[parking].count("plane:" + flightId) == 0) {
+                        push_event_unsafe("flight.arrived_parking_conflict", {
+                            {"flightId", flightId},
+                            {"parking", parking},
+                            {"reason", "parking_already_has_plane"}
+                        });
+                        app::reply_json(res, 409, {{"error", "parking already has a plane"}, {"parking", parking}});
+                        return;
+                    }
+
+                    place_plane_unsafe_(flightId, parking);
+
+                    it->second.status = "ArrivedParking";
+                    push_event_unsafe("flight.arrived_parking", {
                         {"flightId", flightId},
-                        {"parking", parking},
-                        {"reason", "unknown_parking_node"}
+                        {"parking", parking}
                     });
-                    app::reply_json(res, 409, {{"error", "unknown parking node"}, {"parking", parking}});
-                    return;
                 }
 
-                // самолёт должен отобразиться на стойке независимо от того, что FollowMe ещё там
-                if (!node_has_plane_slot_unsafe_(parking) && nodeOcc_[parking].count("plane:" + flightId) == 0) {
-                    // редкий конфликт: на стойке уже другой самолёт
-                    push_event_unsafe("flight.arrived_parking_conflict", {
-                        {"flightId", flightId},
-                        {"parking", parking},
-                        {"reason", "parking_already_has_plane"}
-                    });
-                    // можно решить по-разному; безопасно — не двигать
-                    app::reply_json(res, 409, {{"error", "parking already has a plane"}, {"parking", parking}});
-                    return;
-                }
-
-                place_plane_unsafe_(flightId, parking);
-
-                it->second.status = "ArrivedParking";
-                push_event_unsafe("flight.arrived_parking", {
+                notify_panel_status(flightId, "ArrivedParking", "plane_on_stand", parking);
+                app::reply_json(res, 200, {
+                    {"ok", true},
                     {"flightId", flightId},
                     {"parking", parking}
                 });
+                return;
             }
 
-            notify_panel_status(flightId, "ArrivedParking", "plane_on_stand", parking);
-            app::reply_json(res, 200, {
-                                {"ok", true},
-                                {"flightId", flightId},
-                                {"parking", parking}
-                            });
+            // --- TAKEOFF: самолет доставлен в RE-1 ---
+            if (status == "arrivedRunwayEntrance")
+            {
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+
+                    auto it = sessions_.find(flightId);
+                    if (it == sessions_.end())
+                    {
+                        app::reply_json(res, 404, {{"error", "session_not_found"}});
+                        return;
+                    }
+
+                    // На RE-1 может уже стоять другой самолет -> конфликт
+                    if (!node_has_plane_slot_unsafe_(kLandingNode) &&
+                        nodeOcc_[kLandingNode].count("plane:" + flightId) == 0)
+                    {
+                        push_event_unsafe("flight.arrived_re1_conflict", {
+                            {"flightId", flightId},
+                            {"reason", "re1_has_other_plane"}
+                        });
+                        app::reply_json(res, 409, {{"error", "RE-1 already has a plane"}});
+                        return;
+                    }
+
+                    // Переставляем самолет с парковки (или откуда он был) в RE-1
+                    place_plane_unsafe_(flightId, kLandingNode);
+
+                    it->second.atRunwayEntrance = true;
+                    it->second.status = "ReadyForTakeoff";
+
+                    push_event_unsafe("flight.arrived_runway_entrance", {
+                        {"flightId", flightId},
+                        {"missionType", missionType},
+                        {"node", kLandingNode}
+                    });
+                }
+
+                notify_panel_status(flightId, "ReadyForTakeoff", "plane_at_re1");
+                app::reply_json(res, 200, {
+                    {"ok", true},
+                    {"flightId", flightId},
+                    {"node", kLandingNode}
+                });
+                return;
+            }
+
+            app::reply_json(res, 400, {{"error", "unsupported status"}});
         });
 
         // FollowMe mission completed and vehicle returned
@@ -921,8 +1242,10 @@ public:
                 return;
             }
             const auto& body = *bodyOpt;
+
             const std::string flightId = app::s_or(body, "flightId");
             const std::string vehicleId = app::s_or(body, "vehicleId");
+            const std::string missionType = body.value("missionType", std::string("landing"));
 
             if (flightId.empty() || vehicleId.empty())
             {
@@ -935,15 +1258,86 @@ public:
                 auto it = sessions_.find(flightId);
                 if (it != sessions_.end())
                 {
-                    it->second.status = "MissionCompleted";
+                    if (missionType == "landing") it->second.status = "MissionCompleted";
+                    else                          it->second.status = "TaxiOutMissionCompleted";
                 }
+
+                corridor_release_if_holder_unsafe_(flightId, "mission_completed");
+
                 push_event_unsafe("mission.completed", {
-                                      {"flightId", flightId},
-                                      {"vehicleId", vehicleId}
-                                  });
+                    {"flightId", flightId},
+                    {"vehicleId", vehicleId},
+                    {"missionType", missionType}
+                });
             }
 
-            notify_panel_status(flightId, "Parked", "followme_returned_to_base");
+            // Для landing можно оставить прежнее поведение
+            if (missionType == "landing") {
+                notify_panel_status(flightId, "Parked", "followme_returned_to_base");
+            }
+
+            app::reply_json(res, 200, {{"ok", true}});
+        });
+
+        svr.Post("/v1/followme/mission/failed", [&](const httplib::Request& req, httplib::Response& res)
+        {
+            auto bodyOpt = app::parse_json_body(req);
+            if (!bodyOpt)
+            {
+                app::reply_json(res, 400, {{"error", "invalid json"}});
+                return;
+            }
+            const auto& body = *bodyOpt;
+
+            const std::string flightId = app::s_or(body, "flightId");
+            const std::string vehicleId = app::s_or(body, "vehicleId");
+            const std::string missionType = body.value("missionType", std::string("landing"));
+            const std::string reason = body.value("reason", std::string("unknown"));
+
+            if (flightId.empty())
+            {
+                app::reply_json(res, 400, {{"error", "flightId required"}});
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+
+                auto it = sessions_.find(flightId);
+                if (it != sessions_.end())
+                {
+                    if (missionType == "landing") {
+                        // освобождаем резервы посадки
+                        nodeOcc_[kLandingNode].erase("reservation:" + flightId);
+                        reservedParking_.erase(it->second.parkingNode);
+                        it->second.status = "LandingMissionFailed";
+                    } else {
+                        // сбрасываем подготовку выруливания
+                        it->second.takeoffTaxiRequested = false;
+                        it->second.atRunwayEntrance = false;
+                        it->second.takeoffApproved = false;
+                        nodeOcc_[kTakeoffNode].erase("takeoff_reservation:" + flightId);
+                        it->second.status = "TaxiOutMissionFailed";
+                    }
+                }
+
+                corridor_release_if_holder_unsafe_(flightId, "mission_failed");
+
+                push_event_unsafe("mission.failed", {
+                    {"flightId", flightId},
+                    {"vehicleId", vehicleId},
+                    {"missionType", missionType},
+                    {"reason", reason}
+                });
+            }
+
+            // Статус в панели по вкусу. Для MVP так:
+            if (missionType == "landing") {
+                notify_panel_status(flightId, "Delayed", "followme_mission_failed");
+            } else {
+                notify_panel_status(flightId, "Parked", "taxiout_failed");
+            }
+
             app::reply_json(res, 200, {{"ok", true}});
         });
 
@@ -996,7 +1390,11 @@ public:
                     {"landingApproved", s.landingApproved},
                     {"landed", s.landed},
                     {"status", s.status},
-                    {"createdAt", s.createdAt}
+                    {"createdAt", s.createdAt},
+                    {"takeoffTaxiRequested", s.takeoffTaxiRequested},
+                    {"atRunwayEntrance", s.atRunwayEntrance},
+                    {"takeoffApproved", s.takeoffApproved},
+                    {"tookoff", s.tookoff}
                 });
             }
 
@@ -1656,6 +2054,41 @@ private:
         nodeOcc_[targetNode].insert(token);
     }
 
+    bool corridor_try_acquire_unsafe_(const std::string& flightId, const std::string& missionType)
+    {
+        if (corridorHolderFlightId_.empty())
+        {
+            corridorHolderFlightId_ = flightId;
+            corridorHolderMissionType_ = missionType;
+            push_event_unsafe("corridor.acquired", {
+                {"flightId", flightId},
+                {"missionType", missionType}
+            });
+            return true;
+        }
+
+        // Идемпотентность: тот же рейс уже держит токен
+        if (corridorHolderFlightId_ == flightId)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    void corridor_release_if_holder_unsafe_(const std::string& flightId, const std::string& reason)
+    {
+        if (corridorHolderFlightId_ == flightId)
+        {
+            push_event_unsafe("corridor.released", {
+                {"flightId", flightId},
+                {"missionType", corridorHolderMissionType_},
+                {"reason", reason}
+            });
+            corridorHolderFlightId_.clear();
+            corridorHolderMissionType_.clear();
+        }
+    }
 
 private:
     std::unordered_map<std::string, Node> nodes_;
@@ -1707,6 +2140,9 @@ private:
     // чтобы не спавнить самолеты повторно
     // value: "airborne" или "grounded"
     std::unordered_map<std::string, std::string> spawnedInBoard_;
+
+    std::string corridorHolderFlightId_;
+    std::string corridorHolderMissionType_; // "landing" | "takeoff"
 };
 
 int main(int argc, char** argv)
@@ -1718,7 +2154,7 @@ int main(int argc, char** argv)
     }
 
     // Путь к карте (в Docker обычно будет что-то вроде /app/data/airport_map.json)
-    std::string mapPath = env_or("GC_MAP_PATH", "./data/airport_map.json");
+    std::string mapPath = env_or("GC_MAP_PATH", "../data/airport_map.json");
 
     // InformationPanel
     std::string panelHost = env_or("INFO_HOST", "localhost");

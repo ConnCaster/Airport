@@ -56,6 +56,11 @@
       "type": "runwayEntrance"
     },
     {
+      "name": "RW-1",
+      "capacity": 1,
+      "type": "runwayOut"
+    },
+    {
       "name": "FS-1",
       "capacity": 3,
       "type": "followMeStation"
@@ -243,6 +248,13 @@
       "type": "carRoad",
       "node1": "FS-1",
       "node2": "RE-1"
+    },
+    {
+      "name": "EP-37",
+      "capacity": 1,
+      "type": "carRoad|planeRoad",
+      "node1": "RE-1",
+      "node2": "RW-1"
     },
     {
       "name": "EP-38",

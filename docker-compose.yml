@@ -115,14 +115,35 @@ services:
       GC_PORT: '8081'
       INFO_HOST: information-panel
       INFO_PORT: '8082'
+      HANDLING_HOST: handling-superviser
+      HANDLING_PORT: '8085'
+      BOARD_PUBLIC_HOST: board
       BOARD_PORT: '8084'
     depends_on:
       ground-control:
         condition: service_healthy
       information-panel:
         condition: service_healthy
+      handling-superviser:
+        condition: service_healthy
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8084/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  handling-superviser:
+    <<: *airport-service
+    container_name: handling-superviser
+    command: ['/app/build/HandlingSuperviser', '8085']
+    ports:
+      - '8085:8085'
+    environment:
+      HANDLING_PORT: '8085'
+      BOARD_HOST: board
+      BOARD_PORT: '8084'
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8085/health']
       interval: 5s
       timeout: 3s
       retries: 20
